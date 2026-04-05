@@ -662,6 +662,278 @@ class TestBreakContinue:
         assert fn(100) == sum(i for i in range(100) if i % 2 != 0)
 
 
+class TestListIndexing:
+    """Test list[i] read in loop bodies — Month 1 Feature."""
+
+    def test_sum_list(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(data: list[int], n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += data[i]
+            return s
+
+        data = list(range(100))
+        fn(data, 10)
+        fn(data, 10)
+        assert fn(data, 100) == sum(range(100))
+        assert is_jit_compiled(fn)
+
+    def test_weighted_sum(self) -> None:
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(data: list[int], n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += data[i] * i
+            return s
+
+        data = [10, 20, 30, 40, 50]
+        fn(data, 5)
+        fn(data, 5)
+        expected = sum(data[i] * i for i in range(5))
+        assert fn(data, 5) == expected
+
+    def test_dot_product(self) -> None:
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(a: list[int], b: list[int], n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += a[i] * b[i]
+            return s
+
+        a = list(range(50))
+        b = list(range(50, 100))
+        fn(a, b, 10)
+        fn(a, b, 10)
+        expected = sum(a[i] * b[i] for i in range(50))
+        assert fn(a, b, 50) == expected
+
+
+class TestListWrite:
+    """Test list[i] = x store in loop bodies — Month 2.1 Feature."""
+
+    def test_scale_inplace(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def scale_inplace(data: list[int], n: int) -> int:
+            s = 0
+            for i in range(n):
+                data[i] = data[i] * 2
+                s += i
+            return s
+
+        data = [1, 2, 3, 4, 5]
+        scale_inplace(data, 5)
+        scale_inplace(data, 5)
+
+        data2 = [1, 2, 3, 4, 5]
+        result = scale_inplace(data2, 5)
+        assert result == sum(range(5))
+        assert data2 == [2, 4, 6, 8, 10]
+        assert is_jit_compiled(scale_inplace)
+
+    def test_write_counter(self) -> None:
+        """Write loop counter values into a list."""
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fill_range(data: list[int], n: int) -> int:
+            s = 0
+            for i in range(n):
+                data[i] = i
+                s += i
+            return s
+
+        data = [0] * 5
+        fill_range(data, 5)
+        fill_range(data, 5)
+        data2 = [0] * 5
+        result = fill_range(data2, 5)
+        assert result == sum(range(5))
+        assert data2 == list(range(5))
+
+    def test_readback_after_write(self) -> None:
+        """Write then read back in the same loop iteration."""
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def double_and_sum(data: list[int], n: int) -> int:
+            s = 0
+            for i in range(n):
+                data[i] = data[i] * 2
+                s += data[i]
+            return s
+
+        data = [1, 2, 3, 4, 5]
+        double_and_sum(data, 5)
+        double_and_sum(data, 5)
+        data2 = [1, 2, 3, 4, 5]
+        result = double_and_sum(data2, 5)
+        # s = 2+4+6+8+10 = 30
+        assert result == 30
+        assert data2 == [2, 4, 6, 8, 10]
+
+
+class TestNumPyIndexing:
+    """Test NumPy array indexing — Month 2.2 Feature."""
+
+    def test_sum_f64_array(self) -> None:
+        import numpy as np
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def sum_f64(data: "np.ndarray", n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += data[i]
+            return s
+
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
+        sum_f64(a, 5)
+        sum_f64(a, 5)
+        result = sum_f64(a, 5)
+        assert abs(result - 15.0) < 1e-9
+        assert is_jit_compiled(sum_f64)
+
+    def test_dot_product_f64(self) -> None:
+        import numpy as np
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def dot_f64(a: "np.ndarray", b: "np.ndarray", n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += a[i] * b[i]
+            return s
+
+        v1 = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        v2 = np.array([4.0, 5.0, 6.0], dtype=np.float64)
+        dot_f64(v1, v2, 3)
+        dot_f64(v1, v2, 3)
+        result = dot_f64(v1, v2, 3)
+        assert abs(result - float(np.dot(v1, v2))) < 1e-9
+        assert is_jit_compiled(dot_f64)
+
+    def test_sum_i64_array(self) -> None:
+        import numpy as np
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def sum_i64(data: "np.ndarray", n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += data[i]
+            return s
+
+        a = np.array([10, 20, 30, 40, 50], dtype=np.int64)
+        sum_i64(a, 5)
+        sum_i64(a, 5)
+        result = sum_i64(a, 5)
+        assert result == 150
+        assert is_jit_compiled(sum_i64)
+
+    def test_scale_inplace_f64(self) -> None:
+        import numpy as np
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def scale_f64(data: "np.ndarray", n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                data[i] = data[i] * 2.0
+                s += data[i]
+            return s
+
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
+        scale_f64(a, 5)
+        scale_f64(a, 5)
+        a2 = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64)
+        result = scale_f64(a2, 5)
+        assert a2.tolist() == [2.0, 4.0, 6.0, 8.0, 10.0]
+        assert abs(result - 30.0) < 1e-9
+        assert is_jit_compiled(scale_f64)
+
+    def test_scale_inplace_i64(self) -> None:
+        import numpy as np
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def scale_i64(data: "np.ndarray", n: int) -> int:
+            s = 0
+            for i in range(n):
+                data[i] = data[i] * 2
+                s += i
+            return s
+
+        a = np.array([1, 2, 3, 4, 5], dtype=np.int64)
+        scale_i64(a, 5)
+        scale_i64(a, 5)
+        a2 = np.array([1, 2, 3, 4, 5], dtype=np.int64)
+        result = scale_i64(a2, 5)
+        assert a2.tolist() == [2, 4, 6, 8, 10]
+        assert result == sum(range(5))
+        assert is_jit_compiled(scale_i64)
+
+
+class TestABIFix:
+    """Test args-buffer ABI — eliminates per-arity transmute dispatch (Month 2.3)."""
+
+    def test_five_param_float_return(self) -> None:
+        """Previously panicked: call_int_ret_float only handled ≤3 args."""
+        import numpy as np
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def quad_dot(
+            a: "np.ndarray", b: "np.ndarray", c: "np.ndarray", d: "np.ndarray", n: int
+        ) -> float:
+            s = 0.0
+            for i in range(n):
+                s += a[i] * b[i] + c[i] * d[i]
+            return s
+
+        v = np.ones(10, dtype=np.float64)
+        quad_dot(v, v, v, v, 10)
+        quad_dot(v, v, v, v, 10)
+        result = quad_dot(v, v, v, v, 10)
+        assert abs(result - 20.0) < 1e-9
+        assert is_jit_compiled(quad_dot)
+
+    def test_four_list_params(self) -> None:
+        """Four list params = 5 total (list+list+list+list+n) — previously hit int_fn limit."""
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def four_list_sum(a: list, b: list, c: list, d: list, n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += a[i] + b[i] + c[i] + d[i]
+            return s
+
+        a, b, c, d = list(range(5)), list(range(5)), list(range(5)), list(range(5))
+        four_list_sum(a, b, c, d, 5)
+        four_list_sum(a, b, c, d, 5)
+        result = four_list_sum(a, b, c, d, 5)
+        assert result == 4 * sum(range(5))
+        assert is_jit_compiled(four_list_sum)
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 

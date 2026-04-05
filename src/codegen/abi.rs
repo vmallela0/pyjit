@@ -70,74 +70,11 @@ impl CompiledFunction {
 
 impl CompiledFunction {
     fn call_raw(&self, args: &[u64]) -> u64 {
-        let all_int = self.code.param_types.iter().all(|t| *t == IRType::Int64);
-        let ret_float = self.code.return_type == IRType::Float64;
-
-        if all_int && !ret_float {
-            self.call_int_fn(args) as u64
-        } else if all_int && ret_float {
-            self.call_int_ret_float(args).to_bits()
-        } else {
-            self.call_mixed(args)
-        }
-    }
-
-    #[allow(clippy::missing_transmute_annotations)]
-    fn call_int_fn(&self, args: &[u64]) -> i64 {
+        // ABI: fn(*const u64) -> u64 — args passed as a packed buffer, return is raw bits.
+        // This works for any number of params and any mix of i64/f64 types.
         let ptr = self.code.fn_ptr;
-        let a = |i: usize| args[i] as i64;
         unsafe {
-            match args.len() {
-                0 => std::mem::transmute::<_, unsafe extern "C" fn() -> i64>(ptr)(),
-                1 => std::mem::transmute::<_, unsafe extern "C" fn(i64) -> i64>(ptr)(a(0)),
-                2 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64) -> i64>(ptr)(a(0), a(1)),
-                3 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2)),
-                4 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3)),
-                5 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4)),
-                6 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4), a(5)),
-                7 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4), a(5), a(6)),
-                8 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7)),
-                _ => panic!("too many int arguments (max 8)"),
-            }
-        }
-    }
-
-    #[allow(clippy::missing_transmute_annotations)]
-    fn call_int_ret_float(&self, args: &[u64]) -> f64 {
-        let ptr = self.code.fn_ptr;
-        let a = |i: usize| args[i] as i64;
-        unsafe {
-            match args.len() {
-                0 => std::mem::transmute::<_, unsafe extern "C" fn() -> f64>(ptr)(),
-                1 => std::mem::transmute::<_, unsafe extern "C" fn(i64) -> f64>(ptr)(a(0)),
-                2 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64) -> f64>(ptr)(a(0), a(1)),
-                3 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64) -> f64>(ptr)(a(0), a(1), a(2)),
-                _ => panic!("too many args for int->float signature (max 3)"),
-            }
-        }
-    }
-
-    #[allow(clippy::missing_transmute_annotations)]
-    fn call_mixed(&self, args: &[u64]) -> u64 {
-        let ptr = self.code.fn_ptr;
-        let types = &self.code.param_types;
-        let ret_float = self.code.return_type == IRType::Float64;
-        unsafe {
-            match (args.len(), ret_float) {
-                (1, true) if types[0] == IRType::Int64 => {
-                    std::mem::transmute::<_, unsafe extern "C" fn(i64) -> f64>(ptr)(args[0] as i64).to_bits()
-                }
-                (1, false) if types[0] == IRType::Float64 => {
-                    std::mem::transmute::<_, unsafe extern "C" fn(f64) -> i64>(ptr)(f64::from_bits(args[0])) as u64
-                }
-                (2, true) if types[0] == IRType::Int64 && types[1] == IRType::Int64 => {
-                    std::mem::transmute::<_, unsafe extern "C" fn(i64, i64) -> f64>(ptr)(args[0] as i64, args[1] as i64).to_bits()
-                }
-                (2, false) if types[0] == IRType::Float64 && types[1] == IRType::Float64 => {
-                    std::mem::transmute::<_, unsafe extern "C" fn(f64, f64) -> f64>(ptr)(f64::from_bits(args[0]), f64::from_bits(args[1])).to_bits()
-                }
-                _ => 0, // unsupported — Python guard should prevent reaching here
-            }
+            std::mem::transmute::<_, unsafe extern "C" fn(*const u64) -> u64>(ptr)(args.as_ptr())
         }
     }
 }

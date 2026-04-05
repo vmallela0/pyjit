@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
 import functools
-from typing import Any, Callable, TypeVar, overload
+from typing import Any, Callable, Optional, TypeVar, overload
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -56,7 +57,8 @@ def jit(
                 # Guard: check argument types match what we compiled for
                 if _guard_types(args, compiled_types):
                     try:
-                        return compiled_fn(*args)
+                        native_args = _prepare_native_args(args, compiled_types)
+                        return compiled_fn(*native_args)
                     except (TypeError, OverflowError, SystemError):
                         # Deopt: fall back to CPython on any native error
                         pass
@@ -84,6 +86,16 @@ def jit(
     return decorator
 
 
+def _get_np_ndarray() -> Optional[type]:
+    """Return numpy.ndarray type if numpy is available, else None."""
+    try:
+        import numpy as np
+
+        return np.ndarray
+    except ImportError:
+        return None
+
+
 def _guard_types(args: tuple[Any, ...], expected: tuple[type, ...]) -> bool:
     """Type guard: check all arguments match the expected types.
 
@@ -93,7 +105,15 @@ def _guard_types(args: tuple[Any, ...], expected: tuple[type, ...]) -> bool:
     if len(args) != len(expected):
         return False
 
+    np_ndarray: Optional[type] = _get_np_ndarray()
+
     for arg, exp_type in zip(args, expected):
+        # numpy arrays: guard that the type and dtype still match
+        if np_ndarray is not None and exp_type is np_ndarray:
+            if not isinstance(arg, exp_type):
+                return False
+            continue
+
         # Type must match exactly (no subclass polymorphism in native code)
         if type(arg) is not exp_type:
             return False
@@ -105,6 +125,30 @@ def _guard_types(args: tuple[Any, ...], expected: tuple[type, ...]) -> bool:
                 return False
 
     return True
+
+
+def _prepare_native_args(args: tuple[Any, ...], compiled_types: tuple[type, ...]) -> list[Any]:
+    """Convert Python args to native-ABI values for the compiled function.
+
+    - Lists: replaced with their ob_item pointer (PyObject** array) as i64
+    - NumPy arrays: replaced with their raw data buffer pointer as i64
+    - All other args pass through unchanged.
+    """
+    np_ndarray: Optional[type] = _get_np_ndarray()
+
+    result: list[Any] = []
+    for arg, t in zip(args, compiled_types):
+        if t is list:
+            # PyListObject layout: refcnt(8) + type*(8) + ob_size(8) + ob_item*(8)
+            ob_item_ptr = ctypes.c_ssize_t.from_address(id(arg) + 24).value
+            result.append(ob_item_ptr)
+        elif np_ndarray is not None and t is np_ndarray:
+            # Extract the raw typed data buffer pointer via __array_interface__
+            data_ptr = arg.__array_interface__["data"][0]
+            result.append(data_ptr)
+        else:
+            result.append(arg)
+    return result
 
 
 def _try_compile(func: Callable[..., Any], args: tuple[Any, ...]) -> Any:

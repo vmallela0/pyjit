@@ -48,8 +48,19 @@ def compile_function(
     Supports int and float arguments for loop functions.
     Returns None if the function can't be compiled.
     """
-    # Check all args are numeric (int or float)
-    if not all(isinstance(a, (int, float)) for a in args):
+
+    # Check all args are numeric, lists, or numpy arrays
+    def _is_supported(a: Any) -> bool:
+        if isinstance(a, (int, float, list)):
+            return True
+        try:
+            import numpy as np
+
+            return isinstance(a, np.ndarray)
+        except ImportError:
+            return False
+
+    if not all(_is_supported(a) for a in args):
         return None
 
     loop_result = _try_compile_loop(func, args)
@@ -110,10 +121,27 @@ def _try_compile_loop(
     if iter_var_slot is None:
         return None
 
+    # Build numpy dtype map: param slot → element type ('f64' or 'i64')
+    # Used by _extract_body_ops to choose typed vs boxed element ops.
+    numpy_dtypes: dict[int, str] = {}
+    try:
+        import numpy as np
+
+        for _slot in range(code.co_argcount):
+            if _slot < len(args) and isinstance(args[_slot], np.ndarray):
+                dt = args[_slot].dtype
+                if dt == np.float64:
+                    numpy_dtypes[_slot] = "f64"
+                elif dt in (np.int64, np.int32, np.int16, np.int8):
+                    numpy_dtypes[_slot] = "i64"
+    except ImportError:
+        pass
+
     body_ops = _extract_body_ops(
         instructions[body_start + 1 : body_end],
         code,
         iter_var_slot,
+        numpy_dtypes,
     )
     if body_ops is None:
         return None
@@ -138,7 +166,7 @@ def _try_compile_loop(
         if i < len(args) and isinstance(args[i], float):
             param_types.append(TYPE_F64)
         else:
-            param_types.append(TYPE_I64)
+            param_types.append(TYPE_I64)  # int, list, and numpy arrays all pass as i64 pointer
 
     # Calculate num_locals
     base_locals = code.co_nlocals
@@ -162,14 +190,44 @@ def _try_compile_loop(
     for i, pt in enumerate(param_types):
         if i < num_locals:
             local_types[i] = pt
-    # Temp slots used by body ops that produce float results inherit from their dst
-    # If a body op's dst is a float slot, the temp intermediates should also be float
+    # Propagate float types through temp slots:
+    # 1. LoadElementF64 produces f64; Div always produces f64.
+    # 2. Any arithmetic op whose first input is f64 also produces f64 (iterative fixpoint).
+    _arith_ops = {
+        "Add",
+        "Sub",
+        "Mul",
+        "Div",
+        "TrueDiv",
+        "FloorDiv",
+        "Mod",
+        "Pow",
+        "Abs",
+        "Min",
+        "Max",
+        "Neg",
+    }
     for op_kind, dst, _sa, _sb, _imm, _iv in body_ops:
-        if dst < num_locals and local_types[dst] == TYPE_F64:
-            pass  # already set
-        # If the op is Div (true division), result is float
+        if op_kind == "LoadElementF64" and dst < num_locals:
+            local_types[dst] = TYPE_F64
         if op_kind == "Div" and dst < num_locals:
             local_types[dst] = TYPE_F64
+
+    # Iterative fixpoint: propagate f64 through arithmetic chains
+    changed = True
+    while changed:
+        changed = False
+        for op_kind, dst, src_a, _sb, _imm, _iv in body_ops:
+            if op_kind not in _arith_ops:
+                continue
+            if dst >= num_locals:
+                continue
+            src_is_float = (
+                src_a != COUNTER_SENTINEL and src_a < num_locals and local_types[src_a] == TYPE_F64
+            )
+            if src_is_float and local_types[dst] != TYPE_F64:
+                local_types[dst] = TYPE_F64
+                changed = True
 
     return_type_id = local_types[return_local] if return_local < len(local_types) else TYPE_I64
 
@@ -456,6 +514,7 @@ def _extract_body_ops(
     body_instrs: list[dis.Instruction],
     code: Any,
     iter_var_slot: int,
+    numpy_dtypes: dict[int, str] | None = None,
 ) -> list[tuple[str, int, int, int, bool, int]] | None:
     """Extract loop body operations as (kind, dst, src_a, src_b, is_b_imm, imm).
 
@@ -496,13 +555,29 @@ def _extract_body_ops(
                 return None
             b_val = stack.pop()
             a_val = stack.pop()
-            op_name = _BINOP_MAP.get(arg)
-            if op_name is None:
-                return None
-            result = _make_binop(op_name, a_val, b_val, ops)
-            if result is None:
-                return None
-            stack.append(result)
+
+            if arg == 26:  # NB_SUBSCR: container[index]
+                # a_val = container (should be a param slot), b_val = index
+                container = _resolve_val(a_val, ops)
+                index = _resolve_val(b_val, ops)
+                temp_slot = 100 + len(ops)
+                # Use typed load for NumPy arrays, boxed load for Python lists
+                ndtype = (numpy_dtypes or {}).get(container)
+                if ndtype == "f64":
+                    ops.append(("LoadElementF64", temp_slot, container, index, False, 0))
+                elif ndtype == "i64":
+                    ops.append(("LoadElementI64", temp_slot, container, index, False, 0))
+                else:
+                    ops.append(("LoadElement", temp_slot, container, index, False, 0))
+                stack.append(temp_slot)
+            else:
+                op_name = _BINOP_MAP.get(arg)
+                if op_name is None:
+                    return None
+                result = _make_binop(op_name, a_val, b_val, ops)
+                if result is None:
+                    return None
+                stack.append(result)
 
         elif name == "COMPARE_OP":
             if len(stack) < 2:
@@ -842,6 +917,27 @@ def _extract_body_ops(
 
             i = skip_to
             continue
+
+        elif name == "STORE_SUBSCR":
+            # data[i] = value  →  stack before: [value, container, index]
+            # TOS=index, TOS1=container, TOS2=value
+            if len(stack) < 3:
+                return None
+            key = stack.pop()  # index
+            container = stack.pop()  # container
+            val = stack.pop()  # value to store
+            container_slot = _resolve_val(container, ops)
+            index_ref = _resolve_val(key, ops)
+            value_slot = _resolve_val(val, ops)
+            # Use typed store for NumPy arrays, boxed store for Python lists
+            ndtype = (numpy_dtypes or {}).get(container_slot)
+            if ndtype == "f64":
+                ops.append(("StoreElementF64", container_slot, index_ref, value_slot, False, 0))
+            elif ndtype == "i64":
+                ops.append(("StoreElementI64", container_slot, index_ref, value_slot, False, 0))
+            else:
+                ops.append(("StoreElement", container_slot, index_ref, value_slot, False, 0))
+            # no result pushed to stack
 
         elif name in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "JUMP_FORWARD"):
             pass  # skip jumps that are part of control flow

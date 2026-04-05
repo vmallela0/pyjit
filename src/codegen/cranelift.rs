@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::instructions::BlockArg;
-use cranelift_codegen::ir::{AbiParam, InstBuilder};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -13,6 +13,12 @@ use cranelift_module::{Linkage, Module};
 
 use crate::ir::ops::{IROp, IRProgram, ValueId};
 use crate::ir::types::IRType;
+
+/// Called from JIT-compiled code to box a native i64 into a Python int (PyObject*).
+/// Returns the PyObject* as i64. Handles the full integer range.
+unsafe extern "C" fn pyjit_box_int(val: i64) -> i64 {
+    pyo3::ffi::PyLong_FromLong(val) as i64
+}
 
 /// A compiled native function ready for execution.
 pub struct CompiledCode {
@@ -62,11 +68,10 @@ pub fn compile(program: &IRProgram) -> Result<CompiledCode, String> {
     let native_params: Vec<IRType> = program.param_types.clone();
     let native_return = determine_return_type(program);
 
+    // ABI: fn(*const u64) -> u64 — args-buffer calling convention (same as compile_loop)
     let mut sig = module.make_signature();
-    for ty in &native_params {
-        sig.params.push(AbiParam::new(ir_type_to_cl(ty)));
-    }
-    sig.returns.push(AbiParam::new(ir_type_to_cl(&native_return)));
+    sig.params.push(AbiParam::new(types::I64)); // args: *const u64
+    sig.returns.push(AbiParam::new(types::I64)); // return: u64 bits
 
     let func_id = module
         .declare_function("jit_fn", Linkage::Local, &sig)
@@ -83,26 +88,42 @@ pub fn compile(program: &IRProgram) -> Result<CompiledCode, String> {
         builder.switch_to_block(block0);
         builder.seal_block(block0);
 
+        let args_ptr = builder.block_params(block0)[0];
+
+        // Unpack each param from the args buffer
+        let block_params: Vec<cranelift_codegen::ir::Value> = native_params
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                let raw = builder.ins().load(types::I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
+                match ty {
+                    IRType::Float64 => builder.ins().bitcast(types::F64, MemFlags::new(), raw),
+                    _ => raw,
+                }
+            })
+            .collect();
+
         let mut values: HashMap<ValueId, cranelift_codegen::ir::Value> = HashMap::new();
-        let block_params: Vec<cranelift_codegen::ir::Value> =
-            builder.block_params(block0).to_vec();
         let mut param_idx = 0;
 
         for op in &program.ops {
             translate_op(&mut builder, op, &mut values, &block_params, &mut param_idx);
         }
 
-        if let Some(ret_val) = program.return_value {
+        let ret_bits = if let Some(ret_val) = program.return_value {
             if let Some(&cl_val) = values.get(&ret_val) {
-                builder.ins().return_(&[cl_val]);
+                if native_return == IRType::Float64 {
+                    builder.ins().bitcast(types::I64, MemFlags::new(), cl_val)
+                } else {
+                    cl_val
+                }
             } else {
-                let zero = builder.ins().iconst(types::I64, 0);
-                builder.ins().return_(&[zero]);
+                builder.ins().iconst(types::I64, 0)
             }
         } else {
-            let zero = builder.ins().iconst(types::I64, 0);
-            builder.ins().return_(&[zero]);
-        }
+            builder.ins().iconst(types::I64, 0)
+        };
+        builder.ins().return_(&[ret_bits]);
 
         builder.finalize();
     }
@@ -295,20 +316,28 @@ pub fn compile_loop(
     flag_builder.set("opt_level", "speed").map_err(|e| e.to_string())?;
     let isa_builder = cranelift_native::builder().map_err(|e| format!("host ISA: {e}"))?;
     let isa = isa_builder.finish(settings::Flags::new(flag_builder)).map_err(|e| e.to_string())?;
-    let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    // Register helper: boxes a native i64 into a Python int object.
+    jit_builder.symbol("pyjit_box_int", pyjit_box_int as *const u8);
     let mut module = JITModule::new(jit_builder);
+
+    // Declare pyjit_box_int as an importable function.
+    let mut box_int_sig = module.make_signature();
+    box_int_sig.params.push(AbiParam::new(types::I64));
+    box_int_sig.returns.push(AbiParam::new(types::I64));
+    let box_int_id = module
+        .declare_function("pyjit_box_int", Linkage::Import, &box_int_sig)
+        .map_err(|e| e.to_string())?;
 
     let local_cl_type = |slot: usize| -> types::Type {
         if *local_types.get(slot).unwrap_or(&0) == 1 { types::F64 } else { types::I64 }
     };
 
+    // ABI: always fn(*const u64) -> u64 — args packed as raw u64 bits, return is raw u64 bits.
+    // This eliminates the per-arity transmute dispatch and removes the arg-count limit.
     let mut sig = module.make_signature();
-    for i in 0..num_params {
-        let t = if *param_types_vec.get(i).unwrap_or(&0) == 1 { types::F64 } else { types::I64 };
-        sig.params.push(AbiParam::new(t));
-    }
-    let ret_cl = if return_type_id == 1 { types::F64 } else { types::I64 };
-    sig.returns.push(AbiParam::new(ret_cl));
+    sig.params.push(AbiParam::new(types::I64)); // args: *const u64
+    sig.returns.push(AbiParam::new(types::I64)); // return: u64 bits
 
     let func_id = module.declare_function("jit_loop", Linkage::Local, &sig).map_err(|e| e.to_string())?;
     let mut ctx = module.make_context();
@@ -322,18 +351,29 @@ pub fn compile_loop(
     let block_body = b.create_block();
     let block_exit = b.create_block();
 
-    // --- Entry ---
+    // --- Entry: unpack args from the *const u64 buffer ---
     b.append_block_params_for_function_params(block_entry);
     b.switch_to_block(block_entry);
     b.seal_block(block_entry);
 
-    let params: Vec<cranelift_codegen::ir::Value> = b.block_params(block_entry).to_vec();
+    let args_ptr = b.block_params(block_entry)[0];
+
+    // Unpack each param from args_ptr[i * 8]
+    let unpacked_params: Vec<cranelift_codegen::ir::Value> = (0..num_params).map(|i| {
+        let raw = b.ins().load(types::I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
+        if *param_types_vec.get(i).unwrap_or(&0) == 1 {
+            // f64 param: reinterpret i64 bits as f64
+            b.ins().bitcast(types::F64, MemFlags::new(), raw)
+        } else {
+            raw
+        }
+    }).collect();
 
     let mut init_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
     for slot in 0..num_locals {
         let lt = local_cl_type(slot);
-        let val = if slot < params.len() {
-            params[slot]
+        let val = if slot < unpacked_params.len() {
+            unpacked_params[slot]
         } else if lt == types::F64 {
             let v = init_float_locals.iter().find(|&&(s, _)| s == slot).map(|&(_, v)| v).unwrap_or(0.0);
             b.ins().f64const(v)
@@ -367,8 +407,10 @@ pub fn compile_loop(
     b.switch_to_block(block_body);
     b.seal_block(block_body);
 
+    let box_int_ref = module.declare_func_in_func(box_int_id, b.func);
+
     let mut body_locals = header_locals.clone();
-    emit_body_ops(&mut b, body_ops, &mut body_locals, counter, limit, &local_cl_type, num_locals);
+    emit_body_ops(&mut b, body_ops, &mut body_locals, counter, limit, &local_cl_type, num_locals, box_int_ref);
 
     // Increment counter by step, jump back to header
     let step = b.ins().iconst(types::I64, step_value);
@@ -377,11 +419,18 @@ pub fn compile_loop(
     back.extend(body_locals.iter().map(|&v| BlockArg::Value(v)));
     b.ins().jump(block_header, &back);
 
-    // --- Exit ---
+    // --- Exit: return as raw u64 bits ---
     b.switch_to_block(block_exit);
     b.seal_block(block_exit);
     b.seal_block(block_header);
-    b.ins().return_(&[header_locals[return_local]]);
+    let ret_val = header_locals[return_local];
+    let ret_bits = if return_type_id == 1 {
+        // f64 return: reinterpret as i64 bits
+        b.ins().bitcast(types::I64, MemFlags::new(), ret_val)
+    } else {
+        ret_val
+    };
+    b.ins().return_(&[ret_bits]);
 
     b.finalize();
 
@@ -410,6 +459,7 @@ fn emit_body_ops(
     limit: cranelift_codegen::ir::Value,
     local_cl_type: &dyn Fn(usize) -> types::Type,
     num_locals: usize,
+    box_int_ref: cranelift_codegen::ir::FuncRef,
 ) {
     let counter_slot = usize::MAX;
     let mut cmp_results: HashMap<usize, cranelift_codegen::ir::Value> = HashMap::new();
@@ -464,7 +514,7 @@ fn emit_body_ops(
                 inner_body_locals[inner_iter_slot] = inner_counter;
             }
             // RECURSE: process inner ops (may contain more LoopStart/LoopEnd)
-            emit_body_ops(b, inner_ops, &mut inner_body_locals, inner_counter, inner_limit, local_cl_type, num_locals);
+            emit_body_ops(b, inner_ops, &mut inner_body_locals, inner_counter, inner_limit, local_cl_type, num_locals, box_int_ref);
 
             // Increment inner counter, jump back
             let one = b.ins().iconst(types::I64, 1);
@@ -585,6 +635,143 @@ fn emit_body_ops(
 
         if kind == "LoopEnd" {
             // Should not reach here — LoopEnd is consumed by LoopStart processing
+            i += 1;
+            continue;
+        }
+
+        if kind == "LoadElement" {
+            // dst = result slot, src_a = ob_item pointer slot, src_b = index slot (or counter)
+            let base_ptr = if src_a < locals.len() { locals[src_a] } else { counter };
+            let index = if src_b == counter_slot {
+                counter
+            } else if src_b < locals.len() {
+                locals[src_b]
+            } else {
+                counter
+            };
+
+            // elem_addr = ob_item + index * 8  (each element is a pointer)
+            let eight = b.ins().iconst(types::I64, 8);
+            let byte_offset = b.ins().imul(index, eight);
+            let elem_addr = b.ins().iadd(base_ptr, byte_offset);
+
+            // Load the PyObject* at ob_item[index]
+            let pyobj_ptr = b.ins().load(types::I64, MemFlags::trusted(), elem_addr, 0);
+
+            // Unbox CPython integer: lv_tag at offset 16, ob_digit[0] at offset 24
+            // lv_tag layout: bits[3+] = ndigits, bit[1] = sign (1=negative), bit[2] = immortal
+            let lv_tag = b.ins().load(types::I64, MemFlags::trusted(), pyobj_ptr, 16);
+            let three = b.ins().iconst(types::I64, 3);
+            let ndigits = b.ins().ushr(lv_tag, three);
+
+            let digit_i32 = b.ins().load(types::I32, MemFlags::trusted(), pyobj_ptr, 24);
+            let digit = b.ins().sextend(types::I64, digit_i32);
+
+            let one64 = b.ins().iconst(types::I64, 1);
+            let zero64 = b.ins().iconst(types::I64, 0);
+            let lv_shifted = b.ins().ushr(lv_tag, one64);
+            let sign_bit = b.ins().band(lv_shifted, one64);
+            let neg_digit = b.ins().ineg(digit);
+            let is_neg = b.ins().icmp(IntCC::NotEqual, sign_bit, zero64);
+            let value_if_nonzero = b.ins().select(is_neg, neg_digit, digit);
+
+            let is_zero_int = b.ins().icmp(IntCC::Equal, ndigits, zero64);
+            let value = b.ins().select(is_zero_int, zero64, value_if_nonzero);
+
+            if dst < locals.len() {
+                locals[dst] = value;
+            }
+            i += 1;
+            continue;
+        }
+
+        if kind == "LoadElementF64" || kind == "LoadElementI64" {
+            // NumPy typed load — no boxing, just a raw memory load
+            let base_ptr = if src_a < locals.len() { locals[src_a] } else { counter };
+            let index = if src_b == counter_slot {
+                counter
+            } else if src_b < locals.len() {
+                locals[src_b]
+            } else {
+                counter
+            };
+
+            let eight = b.ins().iconst(types::I64, 8);
+            let byte_offset = b.ins().imul(index, eight);
+            let elem_addr = b.ins().iadd(base_ptr, byte_offset);
+
+            let val = if kind == "LoadElementF64" {
+                b.ins().load(types::F64, MemFlags::trusted(), elem_addr, 0)
+            } else {
+                b.ins().load(types::I64, MemFlags::trusted(), elem_addr, 0)
+            };
+            if dst < locals.len() {
+                locals[dst] = val;
+            }
+            i += 1;
+            continue;
+        }
+
+        if kind == "StoreElementF64" || kind == "StoreElementI64" {
+            // NumPy typed store — no boxing, raw memory write
+            let base_ptr = if dst < locals.len() { locals[dst] } else { counter };
+            let index = if src_a == counter_slot {
+                counter
+            } else if src_a < locals.len() {
+                locals[src_a]
+            } else {
+                counter
+            };
+            let value = if src_b == counter_slot {
+                counter
+            } else if src_b < locals.len() {
+                locals[src_b]
+            } else {
+                counter
+            };
+
+            let eight = b.ins().iconst(types::I64, 8);
+            let byte_offset = b.ins().imul(index, eight);
+            let elem_addr = b.ins().iadd(base_ptr, byte_offset);
+
+            if kind == "StoreElementF64" {
+                b.ins().store(MemFlags::trusted(), value, elem_addr, 0);
+            } else {
+                b.ins().store(MemFlags::trusted(), value, elem_addr, 0);
+            }
+            i += 1;
+            continue;
+        }
+
+        if kind == "StoreElement" {
+            // dst = container_slot (ob_item ptr), src_a = index, src_b = value to store
+            let base_ptr = if dst < locals.len() { locals[dst] } else { counter };
+            let index = if src_a == counter_slot {
+                counter
+            } else if src_a < locals.len() {
+                locals[src_a]
+            } else {
+                counter
+            };
+            let value = if src_b == counter_slot {
+                counter
+            } else if src_b < locals.len() {
+                locals[src_b]
+            } else {
+                counter
+            };
+
+            // elem_addr = ob_item + index * 8
+            let eight = b.ins().iconst(types::I64, 8);
+            let byte_offset = b.ins().imul(index, eight);
+            let elem_addr = b.ins().iadd(base_ptr, byte_offset);
+
+            // Box the i64 value into a Python int object via pyjit_box_int
+            let call_inst = b.ins().call(box_int_ref, &[value]);
+            let pyobj_ptr = b.inst_results(call_inst)[0];
+
+            // Store the PyObject* into ob_item[index]
+            b.ins().store(MemFlags::trusted(), pyobj_ptr, elem_addr, 0);
             i += 1;
             continue;
         }
