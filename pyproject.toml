@@ -5,13 +5,27 @@ build-backend = "maturin"
 [project]
 name = "pyjit"
 version = "0.1.0"
-description = "A tracing JIT compiler for Python"
+description = "A drop-in tracing JIT compiler for Python. Add @jit, get 20-100x speedup."
 requires-python = ">=3.12"
 license = "MIT"
+readme = "README.md"
+authors = [{ name = "Vamsi Mallela" }]
+keywords = ["jit", "compiler", "performance", "cranelift", "optimization"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Compilers",
 ]
+
+[project.urls]
+Repository = "https://github.com/vmallela0/pyjit"
 
 [tool.maturin]
 python-source = "python"
