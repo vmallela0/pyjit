@@ -95,7 +95,9 @@ impl CompiledFunction {
                 4 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3)),
                 5 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4)),
                 6 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4), a(5)),
-                _ => panic!("too many int arguments (max 6)"),
+                7 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4), a(5), a(6)),
+                8 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7)),
+                _ => panic!("too many int arguments (max 8)"),
             }
         }
     }

@@ -409,6 +409,8 @@ fn emit_body_ops(
 ) {
     let counter_slot = usize::MAX;
     let mut cmp_results: HashMap<usize, cranelift_codegen::ir::Value> = HashMap::new();
+    // Stack for nested conditionals: (merge_block, pre-condition locals)
+    let mut cond_stack: Vec<(cranelift_codegen::ir::Block, Vec<cranelift_codegen::ir::Value>)> = Vec::new();
     let mut i = 0;
 
     while i < ops.len() {
@@ -486,8 +488,90 @@ fn emit_body_ops(
             continue;
         }
 
+        if kind == "CondStart" {
+            let cmp_val = cmp_results.get(&dst).copied()
+                .unwrap_or_else(|| if dst < locals.len() { locals[dst] } else { counter });
+
+            let true_block = b.create_block();
+            let merge_block = b.create_block();
+
+            // merge_block has params: one per local
+            for slot in 0..num_locals { b.append_block_param(merge_block, local_cl_type(slot)); }
+
+            // brif: if cond → true_block (no args), else → merge with CURRENT locals
+            let merge_false_args: Vec<BlockArg> = locals.iter().map(|&v| BlockArg::Value(v)).collect();
+            b.ins().brif(cmp_val, true_block, &[], merge_block, &merge_false_args);
+
+            b.switch_to_block(true_block);
+            b.seal_block(true_block);
+
+            cond_stack.push((merge_block, locals.to_vec()));
+
+            i += 1;
+            continue;
+        }
+
+        if kind == "CondElse" {
+            // End of true branch. Jump to a NEW merge, switch to false (using pre-cond locals).
+            if let Some((old_merge, _pre_locals)) = cond_stack.pop() {
+                // The old merge_block was the if-only merge. We no longer need it as merge
+                // because now there's an else. Create a new merge.
+                let new_merge = b.create_block();
+                for slot in 0..num_locals { b.append_block_param(new_merge, local_cl_type(slot)); }
+
+                // True branch → new_merge
+                let true_args: Vec<BlockArg> = locals.iter().map(|&v| BlockArg::Value(v)).collect();
+                b.ins().jump(new_merge, &true_args);
+
+                // The old_merge is now the else block (it receives pre-cond locals from brif)
+                b.switch_to_block(old_merge);
+                b.seal_block(old_merge);
+
+                // Restore locals from old_merge block params (the pre-condition values)
+                let mp: Vec<cranelift_codegen::ir::Value> = b.block_params(old_merge).to_vec();
+                for (slot, &val) in mp.iter().enumerate() {
+                    if slot < locals.len() { locals[slot] = val; }
+                }
+
+                cond_stack.push((new_merge, Vec::new()));
+            }
+            i += 1;
+            continue;
+        }
+
+        if kind == "CondEnd" {
+            if let Some((merge_block, _)) = cond_stack.pop() {
+                let args: Vec<BlockArg> = locals.iter().map(|&v| BlockArg::Value(v)).collect();
+                b.ins().jump(merge_block, &args);
+
+                b.switch_to_block(merge_block);
+                b.seal_block(merge_block);
+
+                let mp: Vec<cranelift_codegen::ir::Value> = b.block_params(merge_block).to_vec();
+                for (slot, &val) in mp.iter().enumerate() {
+                    if slot < locals.len() { locals[slot] = val; }
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if kind == "LoadConst" {
+            // Store a constant into a local slot
+            if dst < locals.len() {
+                let lt = local_cl_type(dst);
+                let val = if lt == types::F64 {
+                    b.ins().f64const(f64::from_bits(imm as u64))
+                } else {
+                    b.ins().iconst(types::I64, imm)
+                };
+                locals[dst] = val;
+            }
+            i += 1;
+            continue;
+        }
+
         if kind == "StoreCounter" {
-            // Store the current loop's counter into a local slot
             if dst < locals.len() {
                 locals[dst] = counter;
             }

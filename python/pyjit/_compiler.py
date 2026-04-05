@@ -451,24 +451,125 @@ def _extract_body_ops(
             stack.append(("cmp", result))
 
         elif name in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"):
-            # Start of conditional — extract true and false branches
             if not stack or not (isinstance(stack[-1], tuple) and stack[-1][0] == "cmp"):
                 return None
             cmp_slot = stack.pop()[1]
 
-            # Find the branch targets by scanning ahead
-            invert = name == "POP_JUMP_IF_TRUE"
-            cond_result = _extract_conditional_branches(
-                instrs, i, cmp_slot, code, iter_var_slot, ops, invert
-            )
-            if cond_result is None:
+            # Find the true/false branch ranges
+            jump_target = instrs[i].argval
+            if name == "POP_JUMP_IF_FALSE":
+                # Fall-through = true branch, jump target = false/merge
+                true_start_idx = i + 1
+            else:
+                # POP_JUMP_IF_TRUE: fall-through = skip, jump target = true body
+                true_start_idx = i + 1
+
+            # Find the true branch end (JUMP_BACKWARD or JUMP_FORWARD from true branch)
+            true_end_idx = None
+            false_start_idx = None
+            for j in range(true_start_idx, len(instrs)):
+                if instrs[j].offset == jump_target:
+                    # This is where the jump target points
+                    true_end_idx = j
+                    break
+                if instrs[j].opname in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
+                    true_end_idx = j
+                    # Check if there's a false branch at the jump target
+                    for k in range(j + 1, len(instrs)):
+                        if instrs[k].offset == jump_target:
+                            false_start_idx = k
+                            break
+                    break
+                if instrs[j].opname == "JUMP_FORWARD":
+                    true_end_idx = j
+                    # False branch starts at the POP_JUMP target
+                    for k in range(j + 1, len(instrs)):
+                        if instrs[k].offset == jump_target:
+                            false_start_idx = k
+                            break
+                    break
+
+            if true_end_idx is None:
                 return None
 
-            new_ops, skip_to, modified_locals = cond_result
-            ops.extend(new_ops)
-            # Update the loop counter for the outer loop
-            i = skip_to
+            # Extract true branch instructions
+            true_instrs = instrs[true_start_idx:true_end_idx]
+            true_instrs = [x for x in true_instrs if x.opname not in ("NOT_TAKEN", "NOP")]
+
+            # Extract true branch body ops recursively
+            true_ops = _extract_body_ops(true_instrs, code, iter_var_slot)
+
+            # If POP_JUMP_IF_TRUE, the "true" branch is actually the skip (false path)
+            # and the jump target is the real body. Swap them.
+            if name == "POP_JUMP_IF_TRUE":
+                # true_instrs is the "skip" path (between fall-through and jump target)
+                # The real body is at jump_target onwards until JUMP_BACKWARD
+                real_body_start = None
+                real_body_end = None
+                for j in range(i + 1, len(instrs)):
+                    if instrs[j].offset == jump_target:
+                        real_body_start = j
+                        break
+                if real_body_start is not None:
+                    for j in range(real_body_start, len(instrs)):
+                        if instrs[j].opname in (
+                            "JUMP_BACKWARD",
+                            "JUMP_BACKWARD_NO_INTERRUPT",
+                        ):
+                            real_body_end = j
+                            break
+
+                if real_body_start is not None:
+                    if real_body_end is None:
+                        real_body_end = len(instrs)
+                    real_instrs = instrs[real_body_start:real_body_end]
+                    true_ops = _extract_body_ops(real_instrs, code, iter_var_slot)
+                    i_skip = max(real_body_end, len(instrs))
+                    false_start_idx = None  # no else for POP_JUMP_IF_TRUE
+                else:
+                    true_ops = None
+                    i_skip = true_end_idx + 1
+                    false_start_idx = None
+            else:
+                i_skip = true_end_idx + 1
+
+            # Determine false branch
+            false_ops: list[tuple[str, int, int, int, bool, int]] | None = None
+            if false_start_idx is not None:
+                # Find false branch end
+                false_end_idx = None
+                for j in range(false_start_idx, len(instrs)):
+                    if instrs[j].opname in (
+                        "JUMP_BACKWARD",
+                        "JUMP_BACKWARD_NO_INTERRUPT",
+                    ):
+                        false_end_idx = j
+                        break
+                if false_end_idx is None:
+                    false_end_idx = len(instrs)  # extends to end of body
+                false_instrs = instrs[false_start_idx:false_end_idx]
+                false_ops = _extract_body_ops(false_instrs, code, iter_var_slot)
+                i_skip = max(false_end_idx, len(instrs))
+
+            # Emit: CondStart + true_ops + [CondElse + false_ops] + CondEnd
+            invert = 0  # we've already handled inversion above
+            ops.append(("CondStart", cmp_slot, invert, 0, False, 0))
+            if true_ops:
+                ops.extend(true_ops)
+            if false_ops:
+                ops.append(("CondElse", 0, 0, 0, False, 0))
+                ops.extend(false_ops)
+            ops.append(("CondEnd", 0, 0, 0, False, 0))
+
+            i = i_skip
             continue
+
+        elif name in (
+            "JUMP_BACKWARD",
+            "JUMP_BACKWARD_NO_INTERRUPT",
+            "JUMP_FORWARD",
+        ):
+            pass  # skip jumps handled by conditional extraction above
 
         elif name in ("STORE_FAST", "STORE_FAST_MAYBE_NULL"):
             if not stack:
@@ -478,6 +579,16 @@ def _extract_body_ops(
                 if ops and ops[-1][1] >= 100:
                     last = ops[-1]
                     ops[-1] = (last[0], arg, last[2], last[3], last[4], last[5])
+            elif isinstance(val, tuple) and len(val) == 2 and val[0] == "imm":
+                # Store a constant into a local: emit a LoadConst op
+                imm_val = val[1]
+                if isinstance(imm_val, float):
+                    import struct
+
+                    imm_bits = struct.unpack("<q", struct.pack("<d", imm_val))[0]
+                    ops.append(("LoadConst", arg, 0, 0, True, imm_bits))
+                else:
+                    ops.append(("LoadConst", arg, 0, 0, True, int(imm_val)))
             elif val == "counter":
                 pass
 
