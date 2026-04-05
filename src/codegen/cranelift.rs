@@ -638,6 +638,19 @@ fn emit_body_ops(
                     let v = b.ins().icmp(cc, a, bv);
                     cmp_results.insert(dst, v);
                 }
+                "Neg" => {
+                    let result = if dst_is_float { b.ins().fneg(a) } else { b.ins().ineg(a) };
+                    if dst < locals.len() { locals[dst] = result; }
+                }
+                "BitNot" => {
+                    let result = b.ins().bnot(a);
+                    if dst < locals.len() { locals[dst] = result; }
+                }
+                "Not" => {
+                    let one = b.ins().iconst(types::I8, 1);
+                    let result = b.ins().bxor(a, one);
+                    if dst < locals.len() { locals[dst] = result; }
+                }
                 _ => {
                     let result = match kind.as_str() {
                         "Add" => b.ins().iadd(a, bv),

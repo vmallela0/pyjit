@@ -387,6 +387,64 @@ class TestNestedLoops:
         assert speedup > 30.0, f"Expected >30x speedup, got {speedup:.1f}x"
 
 
+class TestUnaryOps:
+    """Test unary operators in loop bodies — Sprint Task 1."""
+
+    def test_negation(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += -(i * i)
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(100) == sum(-(i * i) for i in range(100))
+        assert is_jit_compiled(fn)
+
+    def test_bitwise_not(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += ~i
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(100) == sum(~i for i in range(100))
+        assert is_jit_compiled(fn)
+
+
+class TestStackOps:
+    """Test COPY/SWAP/POP_TOP opcodes — Sprint Task 2."""
+
+    def test_pop_top_and_copy_in_body(self) -> None:
+        """POP_TOP/COPY/SWAP are recognized and don't bail."""
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                if i > 50:
+                    s += i
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(100) == sum(i for i in range(100) if i > 50)
+        assert is_jit_compiled(fn)
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 

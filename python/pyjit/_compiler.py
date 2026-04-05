@@ -592,6 +592,49 @@ def _extract_body_ops(
             elif val == "counter":
                 pass
 
+        elif name == "UNARY_NEGATIVE":
+            if not stack:
+                return None
+            val = stack.pop()
+            temp_slot = 100 + len(ops)
+            src = _resolve_val(val, ops)
+            ops.append(("Neg", temp_slot, src, 0, False, 0))
+            stack.append(temp_slot)
+
+        elif name == "UNARY_INVERT":
+            if not stack:
+                return None
+            val = stack.pop()
+            temp_slot = 100 + len(ops)
+            src = _resolve_val(val, ops)
+            ops.append(("BitNot", temp_slot, src, 0, False, 0))
+            stack.append(temp_slot)
+
+        elif name == "UNARY_NOT":
+            if not stack:
+                return None
+            val = stack.pop()
+            temp_slot = 100 + len(ops)
+            src = _resolve_val(val, ops)
+            ops.append(("Not", temp_slot, src, 0, False, 0))
+            stack.append(temp_slot)
+
+        elif name == "COPY":
+            # COPY arg=N: copy the Nth item from TOS (1-indexed)
+            depth = arg if arg else 1
+            if len(stack) >= depth:
+                stack.append(stack[-depth])
+
+        elif name == "SWAP":
+            # SWAP arg=N: swap TOS with the Nth item from TOS (1-indexed)
+            depth = arg if arg else 2
+            if len(stack) >= depth:
+                stack[-1], stack[-depth] = stack[-depth], stack[-1]
+
+        elif name == "POP_TOP":
+            if stack:
+                stack.pop()
+
         elif name in ("RESUME", "NOT_TAKEN", "NOP"):
             pass
 
