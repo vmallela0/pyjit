@@ -78,8 +78,8 @@ def _try_compile_loop(
     if for_iter_idx is None:
         return None
 
-    range_param = _detect_range_param(instructions, for_iter_idx, code)
-    if range_param is None:
+    range_spec = _detect_range_spec(instructions, for_iter_idx, code)
+    if range_spec is None:
         return None
 
     body_start = for_iter_idx + 1
@@ -171,10 +171,31 @@ def _try_compile_loop(
 
     return_type_id = local_types[return_local] if return_local < len(local_types) else TYPE_I64
 
+    # Resolve range spec to limit_param + start/step values
+    # For constant limits, allocate a synthetic local slot
+    stop_spec = range_spec["stop"]
+    start_spec = range_spec["start"]
+    step_spec = range_spec["step"]
+
+    if stop_spec[0] == "param":
+        limit_param = stop_spec[1]
+    elif stop_spec[0] == "const":
+        # Allocate a synthetic local for the constant limit
+        limit_slot = num_locals
+        num_locals += 1
+        local_types.append(TYPE_I64)
+        init_locals_int.append((limit_slot, stop_spec[1]))
+        limit_param = limit_slot
+    else:
+        return None
+
+    start_value = start_spec[1] if start_spec[0] == "const" else 0
+    step_value = step_spec[1] if step_spec[0] == "const" else 1
+
     try:
         return compile_loop_ir(
             num_params=num_params,
-            limit_param=range_param,
+            limit_param=limit_param,
             num_locals=num_locals,
             return_local=return_local,
             init_locals=init_locals_int,
@@ -184,6 +205,8 @@ def _try_compile_loop(
             param_types=param_types,
             return_type_id=return_type_id,
             func_name=func.__name__,
+            start_value=start_value,
+            step_value=step_value,
         )
     except Exception:
         return None
@@ -314,25 +337,70 @@ def _try_compile_while_loop(
     return None
 
 
-def _detect_range_param(
+def _detect_range_spec(
     instructions: list[dis.Instruction],
     for_iter_idx: int,
     code: Any,
-) -> int | None:
-    """Detect `for i in range(param)` and return the param index."""
+) -> dict[str, Any] | None:
+    """Detect range() call pattern and return spec: {stop, start, step}.
+
+    Each value is either ('param', idx) or ('const', value).
+    Returns None if the pattern isn't recognized.
+    """
     idx = for_iter_idx - 1
     if idx < 0 or instructions[idx].opname != "GET_ITER":
         return None
     idx -= 1
     if idx < 0 or instructions[idx].opname != "CALL":
         return None
-    idx -= 1
-    if idx < 0:
+
+    n_args = instructions[idx].arg
+    if n_args is None or n_args < 1 or n_args > 3:
         return None
 
-    load_instr = instructions[idx]
-    if load_instr.opname in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
-        return load_instr.arg
+    def _resolve_load(instr: dis.Instruction) -> tuple[str, int] | None:
+        if instr.opname in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
+            return ("param", instr.arg if instr.arg is not None else 0)
+        if instr.opname == "LOAD_SMALL_INT":
+            return ("const", instr.arg if instr.arg is not None else 0)
+        if instr.opname == "LOAD_CONST" and instr.arg is not None:
+            consts = code.co_consts
+            if instr.arg < len(consts) and isinstance(consts[instr.arg], int):
+                return ("const", consts[instr.arg])
+        return None
+
+    # Collect the arguments (they are the N instructions before CALL, after LOAD_GLOBAL)
+    arg_instrs: list[dis.Instruction] = []
+    scan = idx - 1
+    for _ in range(n_args):
+        if scan < 0:
+            return None
+        arg_instrs.insert(0, instructions[scan])
+        scan -= 1
+
+    if n_args == 1:
+        # range(stop)
+        stop = _resolve_load(arg_instrs[0])
+        if stop is None:
+            return None
+        return {"stop": stop, "start": ("const", 0), "step": ("const", 1)}
+
+    if n_args == 2:
+        # range(start, stop)
+        start = _resolve_load(arg_instrs[0])
+        stop = _resolve_load(arg_instrs[1])
+        if start is None or stop is None:
+            return None
+        return {"stop": stop, "start": start, "step": ("const", 1)}
+
+    if n_args == 3:
+        # range(start, stop, step)
+        start = _resolve_load(arg_instrs[0])
+        stop = _resolve_load(arg_instrs[1])
+        step = _resolve_load(arg_instrs[2])
+        if start is None or stop is None or step is None:
+            return None
+        return {"stop": stop, "start": start, "step": step}
 
     return None
 

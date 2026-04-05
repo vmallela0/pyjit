@@ -119,4 +119,6 @@ def compile_loop_ir(
     param_types: list[int],
     return_type_id: int,
     func_name: str | None = None,
+    start_value: int = 0,
+    step_value: int = 1,
 ) -> CompiledFunction: ...

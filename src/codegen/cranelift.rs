@@ -288,6 +288,8 @@ pub fn compile_loop(
     local_types: &[u8],
     param_types_vec: &[u8],
     return_type_id: u8,
+    start_value: i64,
+    step_value: i64,
 ) -> Result<CompiledCode, String> {
     let mut flag_builder = settings::builder();
     flag_builder.set("opt_level", "speed").map_err(|e| e.to_string())?;
@@ -326,7 +328,6 @@ pub fn compile_loop(
     b.seal_block(block_entry);
 
     let params: Vec<cranelift_codegen::ir::Value> = b.block_params(block_entry).to_vec();
-    let limit = params[limit_param];
 
     let mut init_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
     for slot in 0..num_locals {
@@ -343,7 +344,10 @@ pub fn compile_loop(
         init_vals.push(val);
     }
 
-    let counter_init = b.ins().iconst(types::I64, 0);
+    // Get the loop limit from the appropriate local (may be a param or a constant-init'd local)
+    let limit = init_vals[limit_param];
+
+    let counter_init = b.ins().iconst(types::I64, start_value);
     let mut args: Vec<BlockArg> = vec![BlockArg::Value(counter_init)];
     args.extend(init_vals.iter().map(|&v| BlockArg::Value(v)));
     b.ins().jump(block_header, &args);
@@ -366,9 +370,9 @@ pub fn compile_loop(
     let mut body_locals = header_locals.clone();
     emit_body_ops(&mut b, body_ops, &mut body_locals, counter, limit, &local_cl_type, num_locals);
 
-    // Increment counter, jump back to header
-    let one = b.ins().iconst(types::I64, 1);
-    let counter_next = b.ins().iadd(counter, one);
+    // Increment counter by step, jump back to header
+    let step = b.ins().iconst(types::I64, step_value);
+    let counter_next = b.ins().iadd(counter, step);
     let mut back: Vec<BlockArg> = vec![BlockArg::Value(counter_next)];
     back.extend(body_locals.iter().map(|&v| BlockArg::Value(v)));
     b.ins().jump(block_header, &back);

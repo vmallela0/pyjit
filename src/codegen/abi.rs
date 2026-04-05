@@ -154,7 +154,7 @@ pub fn compile_ir(program: &IRProgram, func_name: Option<String>) -> PyResult<Co
 
 /// Compile a loop function with native loop blocks for maximum performance.
 #[pyfunction]
-#[pyo3(signature = (num_params, limit_param, num_locals, return_local, init_locals, init_float_locals, body_ops, local_types, param_types, return_type_id, func_name=None))]
+#[pyo3(signature = (num_params, limit_param, num_locals, return_local, init_locals, init_float_locals, body_ops, local_types, param_types, return_type_id, func_name=None, start_value=0, step_value=1))]
 #[allow(clippy::too_many_arguments)]
 pub fn compile_loop_ir(
     num_params: usize,
@@ -168,6 +168,8 @@ pub fn compile_loop_ir(
     param_types: Vec<u8>,
     return_type_id: u8,
     func_name: Option<String>,
+    start_value: i64,
+    step_value: i64,
 ) -> PyResult<CompiledFunction> {
     let code = compile_loop(
         num_params,
@@ -180,6 +182,8 @@ pub fn compile_loop_ir(
         &local_types,
         &param_types,
         return_type_id,
+        start_value,
+        step_value,
     )
     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 

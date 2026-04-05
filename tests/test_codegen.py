@@ -499,6 +499,58 @@ class TestBuiltinMath:
         assert is_jit_compiled(fn)
 
 
+class TestRangeLiterals:
+    """Test range() with literals and multi-arg — Sprint Task 4."""
+
+    def test_range_literal(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn() -> int:
+            s = 0
+            for i in range(100):
+                s += i
+            return s
+
+        fn()
+        fn()
+        assert fn() == sum(range(100))
+        assert is_jit_compiled(fn)
+
+    def test_range_two_arg(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(10, n):
+                s += i
+            return s
+
+        fn(50)
+        fn(50)
+        assert fn(100) == sum(range(10, 100))
+        assert is_jit_compiled(fn)
+
+    def test_range_three_arg_step(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(0, n, 2):
+                s += i
+            return s
+
+        fn(50)
+        fn(50)
+        assert fn(100) == sum(range(0, 100, 2))
+        assert is_jit_compiled(fn)
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 
