@@ -7,6 +7,9 @@ from typing import Any, Callable
 
 def is_jit_compiled(fn: Callable[..., Any]) -> bool:
     """Check if a function has been JIT compiled."""
+    get_compiled = getattr(fn, "_pyjit_get_compiled", None)
+    if get_compiled is not None:
+        return get_compiled() is not None
     return bool(getattr(fn, "_pyjit_compiled", False))
 
 
