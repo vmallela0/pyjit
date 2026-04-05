@@ -445,6 +445,60 @@ class TestStackOps:
         assert is_jit_compiled(fn)
 
 
+class TestBuiltinMath:
+    """Test abs/min/max in loop bodies — Sprint Task 3."""
+
+    def test_abs_in_loop(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += abs(i - 50)
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(100) == sum(abs(i - 50) for i in range(100))
+        assert is_jit_compiled(fn)
+
+    def test_min_in_loop(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            lo = 0
+            for i in range(n):
+                lo = min(lo, i - 50)
+            return lo
+
+        fn(10)
+        fn(10)
+        expected = min(i - 50 for i in range(100))
+        assert fn(100) == expected
+        assert is_jit_compiled(fn)
+
+    def test_max_in_loop(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            hi = -999999
+            for i in range(n):
+                hi = max(hi, i * 3 - 100)
+            return hi
+
+        fn(10)
+        fn(10)
+        expected = max(i * 3 - 100 for i in range(100))
+        assert fn(100) == expected
+        assert is_jit_compiled(fn)
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 

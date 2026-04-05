@@ -640,16 +640,69 @@ def _extract_body_ops(
 
         elif name == "CALL":
             n_call_args = arg
-            if n_call_args == 1 and stack:
-                call_arg = stack.pop()
-                if stack:
-                    stack.pop()
-                stack.append(call_arg)
-            else:
-                return None
+            # Check if this is a call to a known builtin
+            builtin_handled = False
+            if n_call_args in (1, 2) and len(stack) >= n_call_args + 1:
+                # Stack: [callable_or_null, arg1, ...argN]
+                # Peek at the callable (it's n_call_args + 1 from top, accounting for NULL)
+                callable_pos = -(n_call_args + 1)
+                callable_val = stack[callable_pos] if abs(callable_pos) <= len(stack) else None
+
+                if isinstance(callable_val, tuple) and callable_val[0] == "builtin":
+                    builtin_name = callable_val[1]
+                    if n_call_args == 1 and builtin_name == "abs":
+                        arg1 = stack.pop()  # the argument
+                        stack.pop()  # pop callable ("builtin", "abs")
+                        # Pop NULL if present
+                        if stack and stack[-1] is None:
+                            stack.pop()
+                        temp_slot = 100 + len(ops)
+                        src = _resolve_val(arg1, ops)
+                        ops.append(("Abs", temp_slot, src, 0, False, 0))
+                        stack.append(temp_slot)
+                        builtin_handled = True
+                    elif n_call_args == 2 and builtin_name in ("min", "max"):
+                        arg2 = stack.pop()
+                        arg1 = stack.pop()
+                        stack.pop()  # pop callable
+                        if stack and stack[-1] is None:
+                            stack.pop()  # pop NULL
+                        temp_slot = 100 + len(ops)
+                        src_a = _resolve_val(arg1, ops)
+                        src_b = _resolve_val(arg2, ops)
+                        op_name = "Min" if builtin_name == "min" else "Max"
+                        ops.append((op_name, temp_slot, src_a, src_b, False, 0))
+                        stack.append(temp_slot)
+                        builtin_handled = True
+
+            if not builtin_handled:
+                # Fall back: 1-arg passthrough (for float()/int() conversions)
+                if n_call_args == 1 and stack:
+                    call_arg = stack.pop()
+                    if stack:
+                        stack.pop()
+                    stack.append(call_arg)
+                else:
+                    return None
 
         elif name == "LOAD_GLOBAL":
-            stack.append(("global", arg))
+            # Resolve the global name to check for known builtins
+            name_idx = arg >> 1  # CPython 3.12+: lower bit is NULL flag
+            names = code.co_names
+            if name_idx < len(names):
+                gname = names[name_idx]
+                if gname in ("abs", "min", "max", "int", "float", "range"):
+                    # Push NULL (for CALL protocol) + builtin marker
+                    if arg & 1:  # NULL flag set
+                        stack.append(None)  # NULL placeholder
+                    stack.append(("builtin", gname))
+                else:
+                    stack.append(("global", arg))
+            else:
+                stack.append(("global", arg))
+
+        elif name == "PUSH_NULL":
+            stack.append(None)  # NULL for CALL protocol
 
         elif name == "FOR_ITER":
             # Nested loop! Extract inner loop structure.

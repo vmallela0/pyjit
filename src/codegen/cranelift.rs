@@ -642,6 +642,35 @@ fn emit_body_ops(
                     let result = if dst_is_float { b.ins().fneg(a) } else { b.ins().ineg(a) };
                     if dst < locals.len() { locals[dst] = result; }
                 }
+                "Abs" => {
+                    let result = if dst_is_float {
+                        b.ins().fabs(a)
+                    } else {
+                        let zero = b.ins().iconst(types::I64, 0);
+                        let is_neg = b.ins().icmp(IntCC::SignedLessThan, a, zero);
+                        let neg_a = b.ins().ineg(a);
+                        b.ins().select(is_neg, neg_a, a)
+                    };
+                    if dst < locals.len() { locals[dst] = result; }
+                }
+                "Min" => {
+                    let result = if dst_is_float {
+                        b.ins().fmin(a, bv)
+                    } else {
+                        let cond = b.ins().icmp(IntCC::SignedLessThan, a, bv);
+                        b.ins().select(cond, a, bv)
+                    };
+                    if dst < locals.len() { locals[dst] = result; }
+                }
+                "Max" => {
+                    let result = if dst_is_float {
+                        b.ins().fmax(a, bv)
+                    } else {
+                        let cond = b.ins().icmp(IntCC::SignedGreaterThan, a, bv);
+                        b.ins().select(cond, a, bv)
+                    };
+                    if dst < locals.len() { locals[dst] = result; }
+                }
                 "BitNot" => {
                     let result = b.ins().bnot(a);
                     if dst < locals.len() { locals[dst] = result; }
