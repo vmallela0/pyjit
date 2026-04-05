@@ -26,11 +26,13 @@ Measured on Apple M-series, Python 3.14, Cranelift 0.130. Median of 50 runs each
 | Function | CPython | pyjit | Speedup |
 |:---|---:|---:|---:|
 | `sum_cubes(100k)` | 5.3 ms | 0.06 ms | **92x** |
-| `sum_squares(1M)` | 34.3 ms | 0.57 ms | **60x** |
-| `countdown(1M)` | 28.7 ms | 0.57 ms | **50x** |
-| `sum_range(1M)` | 22.6 ms | 0.57 ms | **40x** |
+| `sum_squares(1M)` | 33.1 ms | 0.6 ms | **58x** |
+| `while_sum(1M)` | 29.2 ms | 0.6 ms | **50x** |
+| `cond_even_odd(1M)` | 30.2 ms | 0.6 ms | **48x** |
+| `sum_range(1M)` | 22.6 ms | 0.6 ms | **39x** |
+| `float_accumulate(1M)` | 17.4 ms | 0.9 ms | **20x** |
 
-> Average speedup across compiled functions: **55.7x**
+> Average speedup across compiled functions: **~50x**
 
 Functions that can't be compiled fall back to CPython automatically. No wrong answers, no crashes.
 
@@ -149,14 +151,15 @@ pyjit currently compiles **`for i in range(n)` loops with integer arithmetic**:
 
 | Pattern | Compiled? |
 |:---|:---:|
-| `for i in range(n): s += i` | Yes |
-| `for i in range(n): s += i * i * i` | Yes |
-| `for i in range(n): s += f(i)` where f is `+`, `-`, `*`, `//`, `%` | Yes |
-| Simple arithmetic (`a + b`) | Falls back |
-| While loops | Falls back |
+| `for i in range(n): s += expr(i)` | Yes |
+| `while i < n: s += expr(i); i += 1` | Yes |
+| `for i in range(n): if cond: s += i else: s -= i` | Yes |
+| `for i in range(n): if cond: s += i` (filter) | Yes |
+| Float accumulators (`s = 0.0; s += 1.5`) | Yes |
+| Integer arithmetic (`+`, `-`, `*`, `//`, `%`) | Yes |
+| All 6 comparisons (`<`, `<=`, `==`, `!=`, `>`, `>=`) | Yes |
+| Simple arithmetic without loops (`a + b`) | Falls back |
 | Nested for loops | Falls back |
-| Conditionals in loop body | Falls back |
-| Float arithmetic | Falls back |
 | String / collection ops | Falls back |
 
 Fallback is always correct and safe. Functions that don't compile still work via CPython.
