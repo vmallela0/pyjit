@@ -551,6 +551,40 @@ class TestRangeLiterals:
         assert is_jit_compiled(fn)
 
 
+class TestPowerOp:
+    """Test ** operator — Sprint Task 5."""
+
+    def test_square(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += i**2
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(100) == sum(i**2 for i in range(100))
+        assert is_jit_compiled(fn)
+
+    def test_cube(self) -> None:
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += i**3
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(100) == sum(i**3 for i in range(100))
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 

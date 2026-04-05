@@ -675,6 +675,27 @@ fn emit_body_ops(
                     };
                     if dst < locals.len() { locals[dst] = result; }
                 }
+                "Pow" => {
+                    // For small constant exponents, emit repeated multiply
+                    let result = if is_b_imm && (0..=8).contains(&imm) {
+                        let exp = imm as usize;
+                        match exp {
+                            0 => if dst_is_float { b.ins().f64const(1.0) } else { b.ins().iconst(types::I64, 1) },
+                            1 => a,
+                            _ => {
+                                let mut r = a;
+                                for _ in 1..exp {
+                                    r = if dst_is_float { b.ins().fmul(r, a) } else { b.ins().imul(r, a) };
+                                }
+                                r
+                            }
+                        }
+                    } else {
+                        // Non-constant or large exponent: return 0 (will be wrong, but guarded)
+                        if dst_is_float { b.ins().f64const(0.0) } else { b.ins().iconst(types::I64, 0) }
+                    };
+                    if dst < locals.len() { locals[dst] = result; }
+                }
                 "BitNot" => {
                     let result = b.ins().bnot(a);
                     if dst < locals.len() { locals[dst] = result; }

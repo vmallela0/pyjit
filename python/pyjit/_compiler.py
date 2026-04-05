@@ -28,6 +28,8 @@ _BINOP_MAP: dict[int, str] = {
     24: "Div",  # NB_INPLACE_TRUE_DIVIDE
     15: "FloorDiv",  # NB_INPLACE_FLOOR_DIVIDE
     19: "Mod",  # NB_INPLACE_REMAINDER
+    8: "Pow",  # NB_POWER
+    21: "Pow",  # NB_INPLACE_POWER
 }
 
 COUNTER_SENTINEL = 2**64 - 1  # usize::MAX — means "use loop counter"
