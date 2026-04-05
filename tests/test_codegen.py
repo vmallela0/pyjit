@@ -253,6 +253,44 @@ class TestConditionalLoops:
         assert is_jit_compiled(fn)
 
 
+class TestWhileLoops:
+    """Test while loop compilation — Task 3."""
+
+    def test_while_sum(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            i = 0
+            while i < n:
+                s += i
+                i += 1
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(1000) == sum(range(1000))
+        assert is_jit_compiled(fn)
+
+    def test_while_squares(self) -> None:
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            i = 0
+            while i < n:
+                s += i * i
+                i += 1
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(100) == sum(i * i for i in range(100))
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 

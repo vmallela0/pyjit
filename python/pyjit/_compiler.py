@@ -54,6 +54,10 @@ def compile_function(
     if loop_result is not None:
         return loop_result
 
+    while_result = _try_compile_while_loop(func, args)
+    if while_result is not None:
+        return while_result
+
     return None
 
 
@@ -170,6 +174,131 @@ def _try_compile_loop(
         )
     except Exception:
         return None
+
+
+def _try_compile_while_loop(
+    func: Callable[..., Any],
+    args: tuple[Any, ...],
+) -> CompiledFunction | None:
+    """Detect `while i < n: body; i += 1` and compile as a range loop."""
+    code = func.__code__
+    instructions = list(dis.get_instructions(code))
+
+    # Look for pattern: COMPARE_OP + POP_JUMP_IF_FALSE + ... + JUMP_BACKWARD
+    # where the JUMP_BACKWARD target is the COMPARE_OP
+    for i, instr in enumerate(instructions):
+        if instr.opname != "COMPARE_OP":
+            continue
+        if i + 1 >= len(instructions):
+            continue
+        next_instr = instructions[i + 1]
+        if next_instr.opname != "POP_JUMP_IF_FALSE":
+            continue
+
+        # Found a while loop candidate. Check for JUMP_BACKWARD pointing back
+        # to the compare or its preceding load instruction
+        loop_head_offset = instructions[i - 1].offset if i > 0 else instr.offset
+        body_start = i + 2  # after POP_JUMP_IF_FALSE
+        body_end = None
+        for j in range(body_start, len(instructions)):
+            if instructions[j].opname in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
+                target = instructions[j].argval
+                if target is not None and loop_head_offset <= target <= instr.offset:
+                    body_end = j
+                    break
+
+        if body_end is None:
+            continue
+
+        # Detect: the comparison is `local_i < local_n` (a param)
+        # Look at what's loaded before COMPARE_OP
+        if i < 1:
+            continue
+        prev = instructions[i - 1]
+        if prev.opname == "LOAD_FAST_BORROW_LOAD_FAST_BORROW":
+            idx_a = (prev.arg >> 4) & 0xF if prev.arg is not None else 0
+            idx_b = prev.arg & 0xF if prev.arg is not None else 0
+            counter_slot = idx_a
+            limit_slot = idx_b
+        else:
+            continue
+
+        # limit_slot should be a param
+        if limit_slot >= code.co_argcount:
+            continue
+
+        # Skip NOT_TAKEN after POP_JUMP_IF_FALSE
+        body_actual_start = body_start
+        while body_actual_start < body_end and instructions[body_actual_start].opname in (
+            "NOT_TAKEN",
+            "NOP",
+        ):
+            body_actual_start += 1
+
+        # Extract body ops (reuse for-loop body extractor)
+        body_ops = _extract_body_ops(
+            instructions[body_actual_start:body_end],
+            code,
+            counter_slot,  # treat the while counter as the "iter var"
+        )
+        if body_ops is None:
+            continue
+
+        # Find return local
+        return_local = _find_return_local(instructions)
+        if return_local is None:
+            continue
+
+        # Find init locals
+        init_locals_int, init_locals_float, float_slots = _find_init_locals(instructions, i, code)
+
+        # The while loop counter is managed by body ops (i += 1 is in the body).
+        # We can use the same compile_loop infrastructure with the counter as a regular local.
+        # BUT: we need to tell compile_loop that the "loop limit" param controls the loop.
+        # The difference from for-range: the counter lives in a local, not the hardware counter.
+        # We can reuse compile_loop by having the body ops include the i += 1, and
+        # the counter_slot IS the loop variable tracked by compile_loop's counter.
+
+        # Actually, the simplest: detect that body contains `i += 1` and strip it,
+        # then compile as range(limit_slot) loop.
+        # Check if body_ops has an Add to counter_slot with imm 1
+        # (This would be generated as ("Add", counter_slot, counter_slot, 0, True, 1)
+        # but since counter_slot maps to COUNTER_SENTINEL, it'd be different)
+
+        # For now, use compile_loop directly — the while counter IS the range counter
+        num_params = code.co_argcount
+        param_types = [TYPE_I64] * num_params
+        base_locals = code.co_nlocals
+        max_slot = max((op[1] for op in body_ops), default=0)
+        num_locals = max(base_locals, max_slot + 1)
+
+        local_types_list: list[int] = [TYPE_I64] * num_locals
+        for slot in float_slots:
+            if slot < num_locals:
+                local_types_list[slot] = TYPE_F64
+
+        return_type_id = (
+            local_types_list[return_local] if return_local < len(local_types_list) else TYPE_I64
+        )
+
+        try:
+            return compile_loop_ir(
+                num_params=num_params,
+                limit_param=limit_slot,
+                num_locals=num_locals,
+                return_local=return_local,
+                init_locals=init_locals_int,
+                init_float_locals=init_locals_float,
+                body_ops=body_ops,
+                local_types=local_types_list,
+                param_types=param_types,
+                return_type_id=return_type_id,
+                func_name=func.__name__,
+            )
+        except Exception:
+            continue
+
+    return None
 
 
 def _detect_range_param(
