@@ -1,0 +1,26 @@
+[package]
+name = "pyjit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A tracing JIT compiler for Python, built with PyO3 and Cranelift"
+
+[lib]
+name = "_pyjit"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+
+# Cranelift — all pinned to same version
+cranelift-codegen = "0.130"
+cranelift-frontend = "0.130"
+cranelift-module = "0.130"
+cranelift-jit = "0.130"
+cranelift-native = "0.130"
+
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
