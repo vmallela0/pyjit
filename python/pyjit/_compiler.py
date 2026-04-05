@@ -80,9 +80,11 @@ def _try_compile_loop(
 
     body_start = for_iter_idx + 1
     body_end = None
+    # Find the LAST JUMP_BACKWARD before END_FOR (handles if/else with multiple branches)
     for i in range(body_start, len(instructions)):
         if instructions[i].opname in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
-            body_end = i
+            body_end = i  # keep scanning — we want the last one
+        elif instructions[i].opname in ("END_FOR", "POP_ITER"):
             break
 
     if body_end is None:
@@ -193,6 +195,51 @@ def _detect_range_param(
     return None
 
 
+_CMP_MAP: dict[int, str] = {
+    # (arg >> 4) & 0xf gives the comparison type
+    # but the full arg also has flags. Common patterns:
+    # 40 = Lt, 88 = Eq, 148 = Gt, etc. We match on (arg >> 4) & 0xf
+}
+
+
+def _resolve_val(val: Any, ops: list[tuple[str, int, int, int, bool, int]]) -> int:
+    """Resolve a stack value to a local slot or COUNTER_SENTINEL."""
+    if val == "counter":
+        return COUNTER_SENTINEL
+    if isinstance(val, int):
+        return val
+    return 0
+
+
+def _make_binop(
+    op_name: str,
+    a_val: Any,
+    b_val: Any,
+    ops: list[tuple[str, int, int, int, bool, int]],
+) -> int | None:
+    """Emit a binary op and return the temp slot, or None on failure."""
+    temp_slot = 100 + len(ops)
+    src_a = _resolve_val(a_val, ops)
+
+    if isinstance(b_val, tuple) and len(b_val) == 2 and b_val[0] == "imm":
+        imm_val = b_val[1]
+        if isinstance(imm_val, float):
+            import struct
+
+            imm_bits = struct.unpack("<q", struct.pack("<d", imm_val))[0]
+            ops.append((op_name, temp_slot, src_a, 0, True, imm_bits))
+        else:
+            ops.append((op_name, temp_slot, src_a, 0, True, int(imm_val)))
+    elif b_val == "counter":
+        ops.append((op_name, temp_slot, src_a, COUNTER_SENTINEL, False, 0))
+    elif isinstance(b_val, int):
+        ops.append((op_name, temp_slot, src_a, b_val, False, 0))
+    else:
+        return None
+
+    return temp_slot
+
+
 def _extract_body_ops(
     body_instrs: list[dis.Instruction],
     code: Any,
@@ -200,20 +247,21 @@ def _extract_body_ops(
 ) -> list[tuple[str, int, int, int, bool, int]] | None:
     """Extract loop body operations as (kind, dst, src_a, src_b, is_b_imm, imm).
 
-    Uses a stack simulation to track operand flow.
+    Uses a stack simulation. Handles conditionals by detecting the if/else
+    pattern and generating Select ops.
     """
-    stack: list[int | str] = []  # local slot indices or 'counter' or ('imm', val)
+    stack: list[Any] = []
     ops: list[tuple[str, int, int, int, bool, int]] = []
+    i = 0
+    instrs = body_instrs
 
-    for instr in body_instrs:
+    while i < len(instrs):
+        instr = instrs[i]
         name = instr.opname
         arg = instr.arg if instr.arg is not None else 0
 
         if name in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
-            if arg == iter_var_slot:
-                stack.append("counter")
-            else:
-                stack.append(arg)
+            stack.append("counter" if arg == iter_var_slot else arg)
 
         elif name == "LOAD_FAST_BORROW_LOAD_FAST_BORROW":
             idx_a = (arg >> 4) & 0xF
@@ -222,15 +270,14 @@ def _extract_body_ops(
             stack.append("counter" if idx_b == iter_var_slot else idx_b)
 
         elif name == "LOAD_SMALL_INT":
-            stack.append(("imm", arg))  # type: ignore[arg-type]
+            stack.append(("imm", arg))
 
         elif name == "LOAD_CONST":
-            # Handle float constants from co_consts
             consts = code.co_consts
             if arg < len(consts) and isinstance(consts[arg], (int, float)):
-                stack.append(("imm", consts[arg]))  # type: ignore[arg-type]
+                stack.append(("imm", consts[arg]))
             else:
-                return None  # unsupported constant type
+                return None
 
         elif name == "BINARY_OP":
             if len(stack) < 2:
@@ -240,30 +287,46 @@ def _extract_body_ops(
             op_name = _BINOP_MAP.get(arg)
             if op_name is None:
                 return None
+            result = _make_binop(op_name, a_val, b_val, ops)
+            if result is None:
+                return None
+            stack.append(result)
 
-            temp_slot = 100 + len(ops)
+        elif name == "COMPARE_OP":
+            if len(stack) < 2:
+                return None
+            b_val = stack.pop()
+            a_val = stack.pop()
+            # Comparison type is in upper bits
+            cmp_op = arg >> 5
+            cmp_names = {0: "CmpLt", 1: "CmpLe", 2: "CmpEq", 3: "CmpNe", 4: "CmpGt", 5: "CmpGe"}
+            cmp_name = cmp_names.get(cmp_op)
+            if cmp_name is None:
+                return None
+            result = _make_binop(cmp_name, a_val, b_val, ops)
+            if result is None:
+                return None
+            stack.append(("cmp", result))
 
-            src_a = (
-                COUNTER_SENTINEL if a_val == "counter" else (a_val if isinstance(a_val, int) else 0)
+        elif name in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"):
+            # Start of conditional — extract true and false branches
+            if not stack or not (isinstance(stack[-1], tuple) and stack[-1][0] == "cmp"):
+                return None
+            cmp_slot = stack.pop()[1]
+
+            # Find the branch targets by scanning ahead
+            invert = name == "POP_JUMP_IF_TRUE"
+            cond_result = _extract_conditional_branches(
+                instrs, i, cmp_slot, code, iter_var_slot, ops, invert
             )
-            if isinstance(b_val, tuple) and b_val[0] == "imm":
-                imm_val = b_val[1]
-                # For float immediates, encode as int bits
-                if isinstance(imm_val, float):
-                    import struct
-
-                    imm_bits = struct.unpack("<q", struct.pack("<d", imm_val))[0]
-                    ops.append((op_name, temp_slot, src_a, 0, True, imm_bits))
-                else:
-                    ops.append((op_name, temp_slot, src_a, 0, True, int(imm_val)))
-            elif b_val == "counter":
-                ops.append((op_name, temp_slot, src_a, COUNTER_SENTINEL, False, 0))
-            elif isinstance(b_val, int):
-                ops.append((op_name, temp_slot, src_a, b_val, False, 0))
-            else:
+            if cond_result is None:
                 return None
 
-            stack.append(temp_slot)
+            new_ops, skip_to, modified_locals = cond_result
+            ops.extend(new_ops)
+            # Update the loop counter for the outer loop
+            i = skip_to
+            continue
 
         elif name in ("STORE_FAST", "STORE_FAST_MAYBE_NULL"):
             if not stack:
@@ -280,29 +343,206 @@ def _extract_body_ops(
             pass
 
         elif name == "CALL":
-            # Handle float() conversion: CALL on float builtin with 1 arg
-            # The arg on the stack is what gets converted to float
-            # For now, just treat it as a passthrough (the value is already numeric)
             n_call_args = arg
             if n_call_args == 1 and stack:
-                # float(x) or int(x) — passthrough for numeric types
-                val = stack[-1]  # peek at the arg
-                # Pop args + callable (CALL pops n_args + 1 for the callable)
                 call_arg = stack.pop()
                 if stack:
-                    stack.pop()  # pop the callable (LOAD_GLOBAL float)
+                    stack.pop()
                 stack.append(call_arg)
             else:
                 return None
 
         elif name == "LOAD_GLOBAL":
-            # Push a marker for the global (might be float/int builtin)
-            stack.append(("global", arg))  # type: ignore[arg-type]
+            stack.append(("global", arg))
+
+        elif name in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "JUMP_FORWARD"):
+            pass  # skip jumps that are part of control flow
 
         else:
             return None
 
+        i += 1
+
     return ops if ops else None
+
+
+def _extract_conditional_branches(
+    instrs: list[dis.Instruction],
+    jump_idx: int,
+    cmp_slot: int,
+    code: Any,
+    iter_var_slot: int,
+    existing_ops: list[tuple[str, int, int, int, bool, int]],
+    invert: bool = False,
+) -> tuple[list[tuple[str, int, int, int, bool, int]], int, dict[int, int]] | None:
+    """Extract if/else branches and generate Select ops.
+
+    Returns (new_ops, next_instruction_index, modified_locals) or None.
+    """
+    jump_instr = instrs[jump_idx]
+    jump_target = jump_instr.argval  # byte offset of else branch
+
+    # Find where the true branch ends (JUMP_BACKWARD or JUMP_FORWARD)
+    true_start = jump_idx + 1
+    true_end = None
+    for j in range(true_start, len(instrs)):
+        if instrs[j].opname in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "JUMP_FORWARD"):
+            true_end = j
+            break
+        if instrs[j].offset == jump_target:
+            # No true branch — this is an if-without-else
+            true_end = j
+            break
+
+    if true_end is None:
+        return None
+
+    # Find the false branch
+    false_start = None
+    for j in range(true_end, len(instrs)):
+        if instrs[j].offset == jump_target:
+            false_start = j
+            break
+
+    # Extract true branch ops
+    true_ops: list[tuple[str, int, int, int, bool, int]] = []
+    true_stores: dict[int, int] = {}  # local_slot -> temp_slot_with_value
+
+    true_branch = instrs[true_start:true_end]
+    # Skip NOT_TAKEN at the start
+    true_branch = [i for i in true_branch if i.opname not in ("NOT_TAKEN", "NOP")]
+
+    true_result = _extract_branch_ops(true_branch, code, iter_var_slot, existing_ops, true_ops)
+    if true_result is None:
+        return None
+    true_stores = true_result
+
+    # Extract false branch ops (if exists)
+    false_ops: list[tuple[str, int, int, int, bool, int]] = []
+    false_stores: dict[int, int] = {}
+    after_false = true_end + 1  # default: skip past jump
+
+    if false_start is not None:
+        # Find end of false branch
+        false_end = None
+        for j in range(false_start, len(instrs)):
+            if instrs[j].opname in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
+                false_end = j
+                break
+        if false_end is None:
+            false_end = len(instrs)
+
+        false_branch = instrs[false_start:false_end]
+        # Pass existing_ops + true_ops so false branch gets unique temp slots
+        combined_existing = list(existing_ops) + true_ops
+        false_result = _extract_branch_ops(
+            false_branch, code, iter_var_slot, combined_existing, false_ops
+        )
+        if false_result is None:
+            return None
+        false_stores = false_result
+        after_false = false_end + 1
+    else:
+        after_false = true_end + 1
+
+    # Generate Select ops for each modified local
+    all_ops: list[tuple[str, int, int, int, bool, int]] = []
+    all_ops.extend(true_ops)
+    all_ops.extend(false_ops)
+
+    all_modified = set(true_stores.keys()) | set(false_stores.keys())
+    for local_slot in sorted(all_modified):
+        true_val = true_stores.get(local_slot, local_slot)  # unchanged = original value
+        false_val = false_stores.get(local_slot, local_slot)  # unchanged = original value
+        # Select: dst = cmp_slot ? true_val : false_val
+        # Encode as: ("Select", dst, cmp_slot, true_val, false=false_val_in_imm, 0)
+        # We need to encode the false_val. Use a different encoding:
+        # ("Select", dst, true_val, false_val, False, cmp_slot)
+        if invert:
+            all_ops.append(("Select", local_slot, false_val, true_val, False, cmp_slot))
+        else:
+            all_ops.append(("Select", local_slot, true_val, false_val, False, cmp_slot))
+
+    return all_ops, after_false, {}
+
+
+def _extract_branch_ops(
+    branch_instrs: list[dis.Instruction],
+    code: Any,
+    iter_var_slot: int,
+    existing_ops: list[tuple[str, int, int, int, bool, int]],
+    branch_ops: list[tuple[str, int, int, int, bool, int]],
+) -> dict[int, int] | None:
+    """Extract ops from a single branch. Returns {local_slot: temp_slot} for STORE_FASTs."""
+    stack: list[Any] = []
+    stores: dict[int, int] = {}
+    # Start temp slots after existing + branch ops
+    base_temp = 100 + len(existing_ops) + len(branch_ops)
+
+    for instr in branch_instrs:
+        name = instr.opname
+        arg = instr.arg if instr.arg is not None else 0
+
+        if name in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
+            stack.append("counter" if arg == iter_var_slot else arg)
+
+        elif name == "LOAD_FAST_BORROW_LOAD_FAST_BORROW":
+            idx_a = (arg >> 4) & 0xF
+            idx_b = arg & 0xF
+            stack.append("counter" if idx_a == iter_var_slot else idx_a)
+            stack.append("counter" if idx_b == iter_var_slot else idx_b)
+
+        elif name == "LOAD_SMALL_INT":
+            stack.append(("imm", arg))
+
+        elif name == "BINARY_OP":
+            if len(stack) < 2:
+                return None
+            b_val = stack.pop()
+            a_val = stack.pop()
+            op_name = _BINOP_MAP.get(arg)
+            if op_name is None:
+                return None
+            temp_slot = base_temp + len(branch_ops)
+            src_a = _resolve_val(a_val, branch_ops)
+            if isinstance(b_val, tuple) and len(b_val) == 2 and b_val[0] == "imm":
+                imm_val = b_val[1]
+                if isinstance(imm_val, float):
+                    import struct
+
+                    imm_bits = struct.unpack("<q", struct.pack("<d", imm_val))[0]
+                    branch_ops.append((op_name, temp_slot, src_a, 0, True, imm_bits))
+                else:
+                    branch_ops.append((op_name, temp_slot, src_a, 0, True, int(imm_val)))
+            elif b_val == "counter":
+                branch_ops.append((op_name, temp_slot, src_a, COUNTER_SENTINEL, False, 0))
+            elif isinstance(b_val, int):
+                branch_ops.append((op_name, temp_slot, src_a, b_val, False, 0))
+            else:
+                return None
+            stack.append(temp_slot)
+
+        elif name in ("STORE_FAST", "STORE_FAST_MAYBE_NULL"):
+            if not stack:
+                return None
+            val = stack.pop()
+            if isinstance(val, int):
+                # Rewrite last op dst if it was a temp
+                if branch_ops and branch_ops[-1][1] >= 100:
+                    last = branch_ops[-1]
+                    temp = last[1]
+                    branch_ops[-1] = (last[0], temp, last[2], last[3], last[4], last[5])
+                stores[arg] = val if val < 100 else branch_ops[-1][1]
+            elif val == "counter":
+                pass
+
+        elif name in ("NOT_TAKEN", "NOP", "RESUME"):
+            pass
+
+        else:
+            return None
+
+    return stores
 
 
 def _find_return_local(instructions: list[dis.Instruction]) -> int | None:

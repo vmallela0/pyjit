@@ -211,6 +211,48 @@ class TestFloatLoopCompilation:
         assert abs(fn(1000) - 1500.0) < 1e-6
 
 
+class TestConditionalLoops:
+    """Test conditionals in loop bodies — Task 2."""
+
+    def test_conditional_accumulate(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                if i % 2 == 0:
+                    s += i
+                else:
+                    s -= i
+            return s
+
+        fn(10)
+        fn(10)
+        expected = sum(i if i % 2 == 0 else -i for i in range(100))
+        assert fn(100) == expected
+        assert is_jit_compiled(fn)
+
+    def test_filter_sum(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                if i % 3 == 0:
+                    s += i
+            return s
+
+        fn(10)
+        fn(10)
+        expected = sum(i for i in range(100) if i % 3 == 0)
+        assert fn(100) == expected
+        assert is_jit_compiled(fn)
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 

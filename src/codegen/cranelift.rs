@@ -373,9 +373,29 @@ pub fn compile_loop(
     b.seal_block(block_body);
 
     let mut body_locals = header_locals.clone();
-    let counter_slot = usize::MAX; // sentinel
+    let counter_slot = usize::MAX;
+    // Comparison results stored separately (i8 type)
+    let mut cmp_results: HashMap<usize, cranelift_codegen::ir::Value> = HashMap::new();
 
     for (kind, dst, src_a, src_b, is_b_imm, imm) in body_ops {
+        // Handle Select op specially: ("Select", dst, true_slot, false_slot, _, cmp_slot)
+        if kind == "Select" {
+            let cmp_slot = *imm as usize;
+            if let Some(&cond) = cmp_results.get(&cmp_slot) {
+                let true_val = if *src_a < body_locals.len() { body_locals[*src_a] }
+                    else if *src_a == counter_slot { counter }
+                    else { body_locals.get(*src_a).copied().unwrap_or(counter) };
+                let false_val = if *src_b < body_locals.len() { body_locals[*src_b] }
+                    else if *src_b == counter_slot { counter }
+                    else { body_locals.get(*src_b).copied().unwrap_or(counter) };
+                let selected = b.ins().select(cond, true_val, false_val);
+                if *dst < body_locals.len() {
+                    body_locals[*dst] = selected;
+                }
+            }
+            continue;
+        }
+
         let dst_is_float = local_cl_type(*dst) == types::F64;
 
         let a = if *src_a == counter_slot {
@@ -415,6 +435,12 @@ pub fn compile_loop(
                 "Mul" => b.ins().imul(a, bv),
                 "FloorDiv" => b.ins().sdiv(a, bv),
                 "Mod" => b.ins().srem(a, bv),
+                "CmpLt" => { let v = b.ins().icmp(IntCC::SignedLessThan, a, bv); cmp_results.insert(*dst, v); continue; }
+                "CmpLe" => { let v = b.ins().icmp(IntCC::SignedLessThanOrEqual, a, bv); cmp_results.insert(*dst, v); continue; }
+                "CmpEq" => { let v = b.ins().icmp(IntCC::Equal, a, bv); cmp_results.insert(*dst, v); continue; }
+                "CmpNe" => { let v = b.ins().icmp(IntCC::NotEqual, a, bv); cmp_results.insert(*dst, v); continue; }
+                "CmpGt" => { let v = b.ins().icmp(IntCC::SignedGreaterThan, a, bv); cmp_results.insert(*dst, v); continue; }
+                "CmpGe" => { let v = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, bv); cmp_results.insert(*dst, v); continue; }
                 _ => b.ins().iadd(a, bv),
             }
         };
