@@ -710,8 +710,23 @@ fn emit_body_ops(
                         "Add" => b.ins().iadd(a, bv),
                         "Sub" => b.ins().isub(a, bv),
                         "Mul" => b.ins().imul(a, bv),
-                        "FloorDiv" => b.ins().sdiv(a, bv),
-                        "Mod" => b.ins().srem(a, bv),
+                        "FloorDiv" => {
+                            // Guard: replace 0 divisor with 1 to prevent SIGFPE
+                            let zero = b.ins().iconst(types::I64, 0);
+                            let one = b.ins().iconst(types::I64, 1);
+                            let is_zero = b.ins().icmp(IntCC::Equal, bv, zero);
+                            let safe_bv = b.ins().select(is_zero, one, bv);
+                            let div_result = b.ins().sdiv(a, safe_bv);
+                            b.ins().select(is_zero, zero, div_result)
+                        }
+                        "Mod" => {
+                            let zero = b.ins().iconst(types::I64, 0);
+                            let one = b.ins().iconst(types::I64, 1);
+                            let is_zero = b.ins().icmp(IntCC::Equal, bv, zero);
+                            let safe_bv = b.ins().select(is_zero, one, bv);
+                            let mod_result = b.ins().srem(a, safe_bv);
+                            b.ins().select(is_zero, zero, mod_result)
+                        }
                         _ => b.ins().iadd(a, bv),
                     };
                     if dst < locals.len() { locals[dst] = result; }

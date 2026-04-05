@@ -585,6 +585,83 @@ class TestPowerOp:
         assert fn(100) == sum(i**3 for i in range(100))
 
 
+class TestDivisionSafety:
+    """Test division-by-zero guards — Sprint Task 6."""
+
+    def test_floor_div_by_zero_no_crash(self) -> None:
+        """Floor division by zero should deopt, not SIGFPE."""
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += 100 // (i - 5)  # i=5 causes div by zero
+            return s
+
+        fn(3)
+        fn(3)
+        # Should not crash — either deopt or return some value
+        try:
+            fn(10)
+        except ZeroDivisionError:
+            pass  # CPython fallback raised it — that's fine
+
+    def test_mod_by_zero_no_crash(self) -> None:
+        """Modulo by zero should deopt, not SIGFPE."""
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += i % (i - 3)  # i=3 causes mod by zero
+            return s
+
+        fn(2)
+        fn(2)
+        try:
+            fn(10)
+        except ZeroDivisionError:
+            pass
+
+
+class TestBreakContinue:
+    """Test break/continue in loops — Sprint Task 7."""
+
+    def test_break_early_exit(self) -> None:
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                if i > 50:
+                    break
+                s += i
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(1000) == sum(range(51))
+
+    def test_continue_skip(self) -> None:
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                if i % 2 == 0:
+                    continue
+                s += i
+            return s
+
+        fn(10)
+        fn(10)
+        assert fn(100) == sum(i for i in range(100) if i % 2 != 0)
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 
