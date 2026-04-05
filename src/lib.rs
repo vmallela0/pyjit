@@ -2,7 +2,6 @@ use pyo3::prelude::*;
 
 mod tracer;
 mod ir;
-#[allow(unused)]
 mod optimizer;
 mod codegen;
 #[allow(unused)]

@@ -18,26 +18,29 @@ def jit(fn: F) -> F: ...
 
 
 @overload
-def jit(*, warmup: int = 10) -> Callable[[F], F]: ...
+def jit(*, warmup: int = 10, eager: bool = False) -> Callable[[F], F]: ...
 
 
 def jit(
     fn: F | None = None,
     *,
     warmup: int = 10,
+    eager: bool = False,
 ) -> F | Callable[[F], F]:
     """Mark a function for JIT compilation.
 
-    Can be used as ``@jit`` or ``@jit(warmup=10)``.
+    Can be used as ``@jit``, ``@jit(warmup=10)``, or ``@jit(eager=True)``.
 
     After ``warmup`` interpreted calls, the function is traced, compiled
     to native code via Cranelift, and subsequent calls execute natively.
+    With ``eager=True``, compilation is attempted on the very first call.
     If the compiled code's type assumptions are violated (different types,
     None values, bigint overflow), execution gracefully falls back to CPython.
 
     Args:
         fn: The function to decorate (when used as bare ``@jit``).
         warmup: Number of interpreted calls before compilation triggers.
+        eager: If True, compile on the first call instead of after warmup.
 
     Returns:
         The decorated function.
@@ -68,15 +71,26 @@ def jit(
 
             call_count += 1
 
-            # After warmup calls, try to compile
-            if call_count == warmup and not kwargs:
+            # Eager mode: compile on first call; warmup mode: compile after N calls.
+            should_compile = not kwargs and (
+                (eager and call_count == 1) or (not eager and call_count == warmup)
+            )
+            if should_compile:
                 compiled_fn = _try_compile(func, args)
                 if compiled_fn is not None:
                     compiled_types = tuple(type(a) for a in args)
+                    # Eager: immediately use the compiled version for this call too
+                    if eager and _guard_types(args, compiled_types):
+                        try:
+                            native_args = _prepare_native_args(args, compiled_types)
+                            return compiled_fn(*native_args)
+                        except (TypeError, OverflowError, SystemError):
+                            pass
 
             return func(*args, **kwargs)
 
         wrapper._pyjit_warmup = warmup  # type: ignore[attr-defined]
+        wrapper._pyjit_eager = eager  # type: ignore[attr-defined]
         wrapper._pyjit_compiled = False  # type: ignore[attr-defined]
         wrapper._pyjit_get_compiled = lambda: compiled_fn  # type: ignore[attr-defined]
         return wrapper  # type: ignore[return-value]

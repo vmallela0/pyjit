@@ -5,6 +5,7 @@ use pyo3::types::PyTuple;
 
 use crate::ir::ops::IRProgram;
 use crate::ir::types::IRType;
+use crate::optimizer::passes::optimize;
 
 use super::cranelift::{compile, compile_loop, CompiledCode};
 
@@ -74,7 +75,7 @@ impl CompiledFunction {
         // This works for any number of params and any mix of i64/f64 types.
         let ptr = self.code.fn_ptr;
         unsafe {
-            std::mem::transmute::<_, unsafe extern "C" fn(*const u64) -> u64>(ptr)(args.as_ptr())
+            std::mem::transmute::<*const u8, unsafe extern "C" fn(*const u64) -> u64>(ptr)(args.as_ptr())
         }
     }
 }
@@ -82,7 +83,9 @@ impl CompiledFunction {
 /// Compile an IR program and return a callable CompiledFunction.
 #[pyfunction]
 pub fn compile_ir(program: &IRProgram, func_name: Option<String>) -> PyResult<CompiledFunction> {
-    let code = compile(program).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    let mut optimized = program.clone();
+    optimize(&mut optimized);
+    let code = compile(&optimized).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
     Ok(CompiledFunction {
         code,
         func_name: func_name.unwrap_or_else(|| "jit_fn".to_string()),

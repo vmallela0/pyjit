@@ -20,6 +20,21 @@ unsafe extern "C" fn pyjit_box_int(val: i64) -> i64 {
     pyo3::ffi::PyLong_FromLong(val) as i64
 }
 
+// Math helpers — wrap libm/std via Rust's f64 methods.
+extern "C" fn pyjit_sin(x: f64) -> f64 { x.sin() }
+extern "C" fn pyjit_cos(x: f64) -> f64 { x.cos() }
+extern "C" fn pyjit_exp(x: f64) -> f64 { x.exp() }
+extern "C" fn pyjit_log(x: f64) -> f64 { x.ln() }
+
+/// Refs to runtime helper functions, passed into emit_body_ops.
+struct RuntimeRefs {
+    box_int: cranelift_codegen::ir::FuncRef,
+    sin: cranelift_codegen::ir::FuncRef,
+    cos: cranelift_codegen::ir::FuncRef,
+    exp: cranelift_codegen::ir::FuncRef,
+    log: cranelift_codegen::ir::FuncRef,
+}
+
 /// A compiled native function ready for execution.
 pub struct CompiledCode {
     /// The JIT module that owns the compiled code memory.
@@ -317,17 +332,30 @@ pub fn compile_loop(
     let isa_builder = cranelift_native::builder().map_err(|e| format!("host ISA: {e}"))?;
     let isa = isa_builder.finish(settings::Flags::new(flag_builder)).map_err(|e| e.to_string())?;
     let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    // Register helper: boxes a native i64 into a Python int object.
+    // Register runtime helpers.
     jit_builder.symbol("pyjit_box_int", pyjit_box_int as *const u8);
+    jit_builder.symbol("pyjit_sin", pyjit_sin as *const u8);
+    jit_builder.symbol("pyjit_cos", pyjit_cos as *const u8);
+    jit_builder.symbol("pyjit_exp", pyjit_exp as *const u8);
+    jit_builder.symbol("pyjit_log", pyjit_log as *const u8);
     let mut module = JITModule::new(jit_builder);
 
-    // Declare pyjit_box_int as an importable function.
+    // Declare pyjit_box_int: (i64) -> i64
     let mut box_int_sig = module.make_signature();
     box_int_sig.params.push(AbiParam::new(types::I64));
     box_int_sig.returns.push(AbiParam::new(types::I64));
     let box_int_id = module
         .declare_function("pyjit_box_int", Linkage::Import, &box_int_sig)
         .map_err(|e| e.to_string())?;
+
+    // Declare math helpers: (f64) -> f64
+    let mut f64_f64_sig = module.make_signature();
+    f64_f64_sig.params.push(AbiParam::new(types::F64));
+    f64_f64_sig.returns.push(AbiParam::new(types::F64));
+    let sin_id = module.declare_function("pyjit_sin", Linkage::Import, &f64_f64_sig).map_err(|e| e.to_string())?;
+    let cos_id = module.declare_function("pyjit_cos", Linkage::Import, &f64_f64_sig).map_err(|e| e.to_string())?;
+    let exp_id = module.declare_function("pyjit_exp", Linkage::Import, &f64_f64_sig).map_err(|e| e.to_string())?;
+    let log_id = module.declare_function("pyjit_log", Linkage::Import, &f64_f64_sig).map_err(|e| e.to_string())?;
 
     let local_cl_type = |slot: usize| -> types::Type {
         if *local_types.get(slot).unwrap_or(&0) == 1 { types::F64 } else { types::I64 }
@@ -407,10 +435,16 @@ pub fn compile_loop(
     b.switch_to_block(block_body);
     b.seal_block(block_body);
 
-    let box_int_ref = module.declare_func_in_func(box_int_id, b.func);
+    let rt = RuntimeRefs {
+        box_int: module.declare_func_in_func(box_int_id, b.func),
+        sin: module.declare_func_in_func(sin_id, b.func),
+        cos: module.declare_func_in_func(cos_id, b.func),
+        exp: module.declare_func_in_func(exp_id, b.func),
+        log: module.declare_func_in_func(log_id, b.func),
+    };
 
     let mut body_locals = header_locals.clone();
-    emit_body_ops(&mut b, body_ops, &mut body_locals, counter, limit, &local_cl_type, num_locals, box_int_ref);
+    emit_body_ops(&mut b, body_ops, &mut body_locals, counter, limit, &local_cl_type, num_locals, &rt);
 
     // Increment counter by step, jump back to header
     let step = b.ins().iconst(types::I64, step_value);
@@ -451,6 +485,7 @@ pub fn compile_loop(
 ///   — creates an inner loop header/body/exit, counter goes 0..locals[limit_slot]
 /// LoopEnd: ("LoopEnd", 0, 0, 0, False, 0)
 ///   — closes the inner loop, resumes outer body
+#[allow(clippy::too_many_arguments)]
 fn emit_body_ops(
     b: &mut FunctionBuilder,
     ops: &[(String, usize, usize, usize, bool, i64)],
@@ -459,7 +494,7 @@ fn emit_body_ops(
     limit: cranelift_codegen::ir::Value,
     local_cl_type: &dyn Fn(usize) -> types::Type,
     num_locals: usize,
-    box_int_ref: cranelift_codegen::ir::FuncRef,
+    rt: &RuntimeRefs,
 ) {
     let counter_slot = usize::MAX;
     let mut cmp_results: HashMap<usize, cranelift_codegen::ir::Value> = HashMap::new();
@@ -514,7 +549,7 @@ fn emit_body_ops(
                 inner_body_locals[inner_iter_slot] = inner_counter;
             }
             // RECURSE: process inner ops (may contain more LoopStart/LoopEnd)
-            emit_body_ops(b, inner_ops, &mut inner_body_locals, inner_counter, inner_limit, local_cl_type, num_locals, box_int_ref);
+            emit_body_ops(b, inner_ops, &mut inner_body_locals, inner_counter, inner_limit, local_cl_type, num_locals, rt);
 
             // Increment inner counter, jump back
             let one = b.ins().iconst(types::I64, 1);
@@ -734,11 +769,7 @@ fn emit_body_ops(
             let byte_offset = b.ins().imul(index, eight);
             let elem_addr = b.ins().iadd(base_ptr, byte_offset);
 
-            if kind == "StoreElementF64" {
-                b.ins().store(MemFlags::trusted(), value, elem_addr, 0);
-            } else {
-                b.ins().store(MemFlags::trusted(), value, elem_addr, 0);
-            }
+            b.ins().store(MemFlags::trusted(), value, elem_addr, 0);
             i += 1;
             continue;
         }
@@ -767,11 +798,47 @@ fn emit_body_ops(
             let elem_addr = b.ins().iadd(base_ptr, byte_offset);
 
             // Box the i64 value into a Python int object via pyjit_box_int
-            let call_inst = b.ins().call(box_int_ref, &[value]);
+            let call_inst = b.ins().call(rt.box_int, &[value]);
             let pyobj_ptr = b.inst_results(call_inst)[0];
 
             // Store the PyObject* into ob_item[index]
             b.ins().store(MemFlags::trusted(), pyobj_ptr, elem_addr, 0);
+            i += 1;
+            continue;
+        }
+
+        // Explicit float conversion: int → f64
+        if kind == "ToF64" {
+            let val = if src_a < locals.len() { locals[src_a] } else { counter };
+            let result = if local_cl_type(src_a) == types::F64 {
+                val  // already f64
+            } else {
+                b.ins().fcvt_from_sint(types::F64, val)  // i64 → f64
+            };
+            if dst < locals.len() { locals[dst] = result; }
+            i += 1;
+            continue;
+        }
+
+        // Math unary ops
+        if kind == "Sqrt" || kind == "Sin" || kind == "Cos" || kind == "Exp" || kind == "Log" || kind == "Fabs" {
+            let val = if src_a < locals.len() { locals[src_a] } else { counter };
+            // Ensure the input is f64
+            let fval = if local_cl_type(src_a) == types::F64 {
+                val
+            } else {
+                b.ins().fcvt_from_sint(types::F64, val)
+            };
+            let result = match kind.as_str() {
+                "Sqrt" => b.ins().sqrt(fval),
+                "Fabs" => b.ins().fabs(fval),
+                "Sin" => { let c = b.ins().call(rt.sin, &[fval]); b.inst_results(c)[0] }
+                "Cos" => { let c = b.ins().call(rt.cos, &[fval]); b.inst_results(c)[0] }
+                "Exp" => { let c = b.ins().call(rt.exp, &[fval]); b.inst_results(c)[0] }
+                "Log" => { let c = b.ins().call(rt.log, &[fval]); b.inst_results(c)[0] }
+                _ => fval,
+            };
+            if dst < locals.len() { locals[dst] = result; }
             i += 1;
             continue;
         }

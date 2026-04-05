@@ -7,6 +7,7 @@ and delegates to the Cranelift backend for native compilation.
 from __future__ import annotations
 
 import dis
+import sys
 from typing import Any, Callable
 
 from pyjit._pyjit import (
@@ -207,10 +208,9 @@ def _try_compile_loop(
         "Max",
         "Neg",
     }
+    _always_f64_ops = {"LoadElementF64", "Div", "Sqrt", "Sin", "Cos", "Exp", "Log", "Fabs", "ToF64"}
     for op_kind, dst, _sa, _sb, _imm, _iv in body_ops:
-        if op_kind == "LoadElementF64" and dst < num_locals:
-            local_types[dst] = TYPE_F64
-        if op_kind == "Div" and dst < num_locals:
+        if op_kind in _always_f64_ops and dst < num_locals:
             local_types[dst] = TYPE_F64
 
     # Iterative fixpoint: propagate f64 through arithmetic chains
@@ -584,8 +584,8 @@ def _extract_body_ops(
                 return None
             b_val = stack.pop()
             a_val = stack.pop()
-            # Comparison type is in upper bits
-            cmp_op = arg >> 5
+            # Comparison type encoding changed in Python 3.14 (arg >> 5) vs 3.12/3.13 (arg >> 4)
+            cmp_op = arg >> 5 if sys.version_info >= (3, 14) else arg >> 4
             cmp_names = {0: "CmpLt", 1: "CmpLe", 2: "CmpEq", 3: "CmpNe", 4: "CmpGt", 5: "CmpGe"}
             cmp_name = cmp_names.get(cmp_op)
             if cmp_name is None:
@@ -787,31 +787,64 @@ def _extract_body_ops(
             n_call_args = arg
             # Check if this is a call to a known builtin
             builtin_handled = False
+            _math_unary = {
+                "math.sqrt": "Sqrt",
+                "math.sin": "Sin",
+                "math.cos": "Cos",
+                "math.exp": "Exp",
+                "math.log": "Log",
+                "math.fabs": "Fabs",
+            }
             if n_call_args in (1, 2) and len(stack) >= n_call_args + 1:
-                # Stack: [callable_or_null, arg1, ...argN]
-                # Peek at the callable (it's n_call_args + 1 from top, accounting for NULL)
+                # Stack: [..., NULL?, callable, arg1, ...argN]
+                # The callable is at -(n_call_args + 1), but NULL placeholders may shift it.
                 callable_pos = -(n_call_args + 1)
                 callable_val = stack[callable_pos] if abs(callable_pos) <= len(stack) else None
+                # If callable slot is a None (NULL), look one deeper for the real callable.
+                if callable_val is None:
+                    deeper = callable_pos - 1
+                    if abs(deeper) <= len(stack):
+                        callable_val = stack[deeper]
+                        callable_pos = deeper
 
                 if isinstance(callable_val, tuple) and callable_val[0] == "builtin":
                     builtin_name = callable_val[1]
                     if n_call_args == 1 and builtin_name == "abs":
                         arg1 = stack.pop()  # the argument
-                        stack.pop()  # pop callable ("builtin", "abs")
-                        # Pop NULL if present
-                        if stack and stack[-1] is None:
+                        # Pop everything from TOS down to and including the callable.
+                        while stack and stack[-1] != ("builtin", "abs"):
                             stack.pop()
+                        if stack:
+                            stack.pop()  # pop callable
+                        if stack and stack[-1] is None:
+                            stack.pop()  # pop NULL below callable
                         temp_slot = 100 + len(ops)
                         src = _resolve_val(arg1, ops)
                         ops.append(("Abs", temp_slot, src, 0, False, 0))
                         stack.append(temp_slot)
                         builtin_handled = True
+                    elif n_call_args == 1 and builtin_name in _math_unary:
+                        arg1 = stack.pop()
+                        while stack and stack[-1] != ("builtin", builtin_name):
+                            stack.pop()
+                        if stack:
+                            stack.pop()  # pop callable
+                        if stack and stack[-1] is None:
+                            stack.pop()  # pop NULL below callable
+                        temp_slot = 100 + len(ops)
+                        src = _resolve_val(arg1, ops)
+                        ops.append((_math_unary[builtin_name], temp_slot, src, 0, False, 0))
+                        stack.append(temp_slot)
+                        builtin_handled = True
                     elif n_call_args == 2 and builtin_name in ("min", "max"):
                         arg2 = stack.pop()
                         arg1 = stack.pop()
-                        stack.pop()  # pop callable
+                        while stack and stack[-1] != ("builtin", builtin_name):
+                            stack.pop()
+                        if stack:
+                            stack.pop()  # pop callable
                         if stack and stack[-1] is None:
-                            stack.pop()  # pop NULL
+                            stack.pop()  # pop NULL below callable
                         temp_slot = 100 + len(ops)
                         src_a = _resolve_val(arg1, ops)
                         src_b = _resolve_val(arg2, ops)
@@ -821,12 +854,28 @@ def _extract_body_ops(
                         builtin_handled = True
 
             if not builtin_handled:
-                # Fall back: 1-arg passthrough (for float()/int() conversions)
+                # Fall back: handle float()/int() type conversions.
                 if n_call_args == 1 and stack:
-                    call_arg = stack.pop()
-                    if stack:
-                        stack.pop()
-                    stack.append(call_arg)
+                    call_arg = stack.pop()  # pop arg
+                    popped_callable = stack.pop() if stack else None  # pop callable
+                    if stack and stack[-1] is None:
+                        stack.pop()  # pop NULL placeholder if present
+                    callable_name = (
+                        popped_callable[1]
+                        if isinstance(popped_callable, tuple) and len(popped_callable) == 2
+                        else None
+                    )
+                    if callable_name == "float":
+                        # Emit explicit ToF64 conversion so type propagation marks the result f64.
+                        temp_slot = 100 + len(ops)
+                        src = _resolve_val(call_arg, ops)
+                        ops.append(("ToF64", temp_slot, src, 0, False, 0))
+                        stack.append(temp_slot)
+                    elif callable_name in ("int", "range"):
+                        # Passthrough — keep value as-is
+                        stack.append(call_arg)
+                    else:
+                        return None  # unknown callable — bail out
                 else:
                     return None
 
@@ -841,10 +890,46 @@ def _extract_body_ops(
                     if arg & 1:  # NULL flag set
                         stack.append(None)  # NULL placeholder
                     stack.append(("builtin", gname))
+                elif gname == "math":
+                    # Push module marker — LOAD_ATTR will replace it with the specific func
+                    stack.append(("module", "math"))
                 else:
                     stack.append(("global", arg))
             else:
                 stack.append(("global", arg))
+
+        elif name == "LOAD_DEREF":
+            # Cell or free variable access (e.g. math imported in an outer scope).
+            # Use the argval (resolved name) rather than the raw index.
+            var_name = instr.argval if instr.argval is not None else ""
+            if var_name == "math":
+                stack.append(("module", "math"))
+            else:
+                return None  # can't handle arbitrary free-variable access
+
+        elif name == "LOAD_ATTR":
+            # CPython 3.12+: arg encodes (namei << 1 | method_flag)
+            attr_idx = arg >> 1
+            names = code.co_names
+            if not stack:
+                return None
+            obj = stack[-1]
+            if (
+                isinstance(obj, tuple)
+                and obj[0] == "module"
+                and obj[1] == "math"
+                and attr_idx < len(names)
+            ):
+                attr_name = names[attr_idx]
+                if attr_name in ("sqrt", "sin", "cos", "exp", "log", "fabs"):
+                    stack.pop()  # pop the module
+                    if arg & 1:  # method flag: push NULL then callable
+                        stack.append(None)
+                    stack.append(("builtin", f"math.{attr_name}"))
+                else:
+                    return None  # unsupported math attribute
+            else:
+                return None  # can't handle arbitrary attribute access
 
         elif name == "PUSH_NULL":
             stack.append(None)  # NULL for CALL protocol

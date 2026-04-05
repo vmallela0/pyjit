@@ -984,3 +984,191 @@ class TestEndToEndJit:
         assert sum_range(0) == 0
         assert sum_range(10) == 45
         assert sum_range(1000) == 499500
+
+
+class TestEagerJit:
+    """Test @jit(eager=True) — compiles on first call."""
+
+    def test_eager_compiles_on_first_call(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(eager=True)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += i
+            return s
+
+        # First call should compile AND execute correctly.
+        assert fn(10) == 45
+        assert is_jit_compiled(fn)
+
+    def test_eager_correctness(self) -> None:
+        from pyjit import jit
+
+        @jit(eager=True)
+        def sum_squares(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += i * i
+            return s
+
+        assert sum_squares(100) == sum(i * i for i in range(100))
+        assert sum_squares(0) == 0
+
+    def test_eager_float(self) -> None:
+        from pyjit import jit
+
+        @jit(eager=True)
+        def sum_float(n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += 1.5
+            return s
+
+        assert abs(sum_float(100) - 150.0) < 1e-9
+
+
+class TestMathBuiltins:
+    """Test math module builtins in loop bodies — Month 4.2."""
+
+    def test_sqrt_in_loop(self) -> None:
+        import math
+
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def sum_sqrt(n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += math.sqrt(float(i))
+            return s
+
+        sum_sqrt(10)
+        sum_sqrt(10)
+        expected = sum(math.sqrt(float(i)) for i in range(100))
+        assert abs(sum_sqrt(100) - expected) < 1e-6
+        assert is_jit_compiled(sum_sqrt)
+
+    def test_sqrt_with_numpy(self) -> None:
+        import math
+
+        import numpy as np
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def sum_sqrt_np(data: "np.ndarray", n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += math.sqrt(data[i])
+            return s
+
+        a = np.array([1.0, 4.0, 9.0, 16.0, 25.0], dtype=np.float64)
+        sum_sqrt_np(a, 5)
+        sum_sqrt_np(a, 5)
+        result = sum_sqrt_np(a, 5)
+        assert abs(result - (1.0 + 2.0 + 3.0 + 4.0 + 5.0)) < 1e-9
+        assert is_jit_compiled(sum_sqrt_np)
+
+    def test_fabs_in_loop(self) -> None:
+        import math
+
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def sum_fabs(n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += math.fabs(float(i) - 50.0)
+            return s
+
+        sum_fabs(10)
+        sum_fabs(10)
+        expected = sum(math.fabs(float(i) - 50.0) for i in range(100))
+        assert abs(sum_fabs(100) - expected) < 1e-6
+        assert is_jit_compiled(sum_fabs)
+
+    def test_exp_in_loop(self) -> None:
+        import math
+
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def sum_exp(n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += math.exp(float(i) * 0.01)
+            return s
+
+        sum_exp(10)
+        sum_exp(10)
+        expected = sum(math.exp(float(i) * 0.01) for i in range(20))
+        assert abs(sum_exp(20) - expected) < 1e-6
+        assert is_jit_compiled(sum_exp)
+
+    def test_sin_cos_in_loop(self) -> None:
+        import math
+
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def sum_sin(n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += math.sin(float(i) * 0.1)
+            return s
+
+        sum_sin(10)
+        sum_sin(10)
+        expected = sum(math.sin(float(i) * 0.1) for i in range(50))
+        assert abs(sum_sin(50) - expected) < 1e-9
+        assert is_jit_compiled(sum_sin)
+
+
+class TestConstFolding:
+    """Test that the const-fold + DCE optimizer passes work correctly."""
+
+    def test_const_fold_add(self) -> None:
+        from pyjit._pyjit import IROp, IRProgram, IRType, compile_ir
+
+        # v0 = LoadConst 3, v1 = LoadConst 4, v2 = Add v0 v1 → return v2
+        ops = [
+            IROp("LoadConst", output=0, inputs=[], output_type=IRType.Int64, immediate=3),
+            IROp("LoadConst", output=1, inputs=[], output_type=IRType.Int64, immediate=4),
+            IROp("Add", output=2, inputs=[0, 1], output_type=IRType.Int64),
+        ]
+        prog = IRProgram(ops=ops, return_value=2, num_params=0, param_types=[])
+        fn = compile_ir(prog, "const_add")
+        assert fn() == 7
+
+    def test_const_fold_mul(self) -> None:
+        from pyjit._pyjit import IROp, IRProgram, IRType, compile_ir
+
+        ops = [
+            IROp("LoadConst", output=0, inputs=[], output_type=IRType.Int64, immediate=6),
+            IROp("LoadConst", output=1, inputs=[], output_type=IRType.Int64, immediate=7),
+            IROp("Mul", output=2, inputs=[0, 1], output_type=IRType.Int64),
+        ]
+        prog = IRProgram(ops=ops, return_value=2, num_params=0, param_types=[])
+        fn = compile_ir(prog, "const_mul")
+        assert fn() == 42
+
+    def test_dce_removes_unused(self) -> None:
+        """An unused value is emitted but doesn't affect the result."""
+        from pyjit._pyjit import IROp, IRProgram, IRType, compile_ir
+
+        ops = [
+            IROp("Param", output=0, inputs=[], output_type=IRType.Int64),
+            IROp("LoadConst", output=1, inputs=[], output_type=IRType.Int64, immediate=999),
+            # v1 is never used — DCE should eliminate it
+            IROp("Add", output=2, inputs=[0, 0], output_type=IRType.Int64),
+        ]
+        prog = IRProgram(ops=ops, return_value=2, num_params=1, param_types=[IRType.Int64])
+        fn = compile_ir(prog, "dce_test")
+        assert fn(5) == 10  # 5+5, not using v1 at all
