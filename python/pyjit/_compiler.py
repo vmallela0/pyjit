@@ -84,12 +84,20 @@ def _try_compile_loop(
 
     body_start = for_iter_idx + 1
     body_end = None
-    # Find the LAST JUMP_BACKWARD before END_FOR (handles if/else with multiple branches)
+    # Find the LAST JUMP_BACKWARD before the OUTER END_FOR.
+    # Must track nesting depth: inner FOR_ITER/END_FOR pairs are skipped.
+    depth = 0
     for i in range(body_start, len(instructions)):
-        if instructions[i].opname in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
-            body_end = i  # keep scanning — we want the last one
-        elif instructions[i].opname in ("END_FOR", "POP_ITER"):
-            break
+        op = instructions[i].opname
+        if op == "FOR_ITER":
+            depth += 1
+        elif op == "END_FOR":
+            if depth > 0:
+                depth -= 1
+            else:
+                break  # this is our outer END_FOR
+        elif op in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT") and depth == 0:
+            body_end = i
 
     if body_end is None:
         return None
@@ -107,6 +115,11 @@ def _try_compile_loop(
     )
     if body_ops is None:
         return None
+
+    # Prepend: store the loop counter into the iter var's local slot.
+    # This is critical for nested loops where inner bodies reference
+    # the outer counter via its local slot (not COUNTER_SENTINEL).
+    body_ops.insert(0, ("StoreCounter", iter_var_slot, 0, 0, False, 0))
 
     return_local = _find_return_local(instructions)
     if return_local is None:
@@ -484,8 +497,80 @@ def _extract_body_ops(
         elif name == "LOAD_GLOBAL":
             stack.append(("global", arg))
 
+        elif name == "FOR_ITER":
+            # Nested loop! Extract inner loop structure.
+            # The stack should have: [("global", range), limit_slot, call_result, iterator]
+            # from preceding: LOAD_GLOBAL range, LOAD_FAST x, CALL 1, GET_ITER
+            # Pop the iterator/call/global markers from the stack
+            stack.clear()  # these are intermediate values, not needed
+
+            # Next instruction should be STORE_FAST for inner iter variable
+            if i + 1 >= len(instrs):
+                return None
+            inner_store = instrs[i + 1]
+            if inner_store.opname != "STORE_FAST" or inner_store.arg is None:
+                return None
+            inner_iter_slot = inner_store.arg
+
+            # Find the range param: look backwards for LOAD_FAST before CALL/GET_ITER
+            inner_limit_slot = None
+            for back in range(i - 1, -1, -1):
+                bi = instrs[back]
+                if bi.opname in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
+                    inner_limit_slot = bi.arg
+                    break
+                if bi.opname in ("LOAD_GLOBAL", "CALL", "GET_ITER"):
+                    continue
+                break
+            if inner_limit_slot is None:
+                return None
+
+            # Find inner body: from STORE_FAST+1 to the LAST JUMP_BACKWARD
+            # before the matching END_FOR (depth-aware)
+            inner_body_start = i + 2
+            inner_body_end = None
+            inner_depth = 0
+            for j in range(inner_body_start, len(instrs)):
+                jop = instrs[j].opname
+                if jop == "FOR_ITER":
+                    inner_depth += 1
+                elif jop == "END_FOR":
+                    if inner_depth > 0:
+                        inner_depth -= 1
+                    else:
+                        break  # matching END_FOR for this FOR_ITER
+                elif jop in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT") and inner_depth == 0:
+                    inner_body_end = j
+            if inner_body_end is None:
+                return None
+
+            # Find END_FOR + POP_ITER after inner JUMP_BACKWARD
+            skip_to = inner_body_end + 1
+            while skip_to < len(instrs) and instrs[skip_to].opname in (
+                "END_FOR",
+                "POP_ITER",
+            ):
+                skip_to += 1
+
+            # Recursively extract inner body ops
+            inner_body_instrs = instrs[inner_body_start:inner_body_end]
+            inner_ops = _extract_body_ops(inner_body_instrs, code, inner_iter_slot)
+            if inner_ops is None:
+                return None
+
+            # Emit: LoopStart + inner ops + LoopEnd
+            ops.append(("LoopStart", inner_limit_slot, inner_iter_slot, 0, False, 0))
+            ops.extend(inner_ops)
+            ops.append(("LoopEnd", 0, 0, 0, False, 0))
+
+            i = skip_to
+            continue
+
         elif name in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "JUMP_FORWARD"):
             pass  # skip jumps that are part of control flow
+
+        elif name in ("GET_ITER", "CALL", "END_FOR", "POP_ITER"):
+            pass  # skip loop setup/teardown instructions
 
         else:
             return None

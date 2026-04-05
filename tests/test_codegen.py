@@ -291,6 +291,102 @@ class TestWhileLoops:
         assert fn(100) == sum(i * i for i in range(100))
 
 
+class TestNestedLoops:
+    """Test nested loop compilation — Task 4."""
+
+    def test_double_nested_sum(self) -> None:
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                for j in range(n):
+                    s += i * j
+            return s
+
+        fn(5)
+        fn(5)
+        expected = sum(i * j for i in range(50) for j in range(50))
+        assert fn(50) == expected
+        assert is_jit_compiled(fn)
+
+    def test_triple_nested(self) -> None:
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                for j in range(n):
+                    for k in range(n):
+                        s += i * j * k
+            return s
+
+        fn(5)
+        fn(5)
+        expected = sum(i * j * k for i in range(10) for j in range(10) for k in range(10))
+        assert fn(10) == expected
+
+    def test_nested_different_limits(self) -> None:
+        """Inner and outer loops use the same param as limit."""
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                for j in range(n):
+                    s += i + j
+            return s
+
+        fn(5)
+        fn(5)
+        expected = sum(i + j for i in range(30) for j in range(30))
+        assert fn(30) == expected
+
+    def test_nested_speedup(self) -> None:
+        """Nested loops should be the biggest speedup — >50x."""
+        import time
+
+        from pyjit import jit
+
+        @jit(warmup=2)
+        def jit_fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                for j in range(n):
+                    s += i * j
+            return s
+
+        def py_fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                for j in range(n):
+                    s += i * j
+            return s
+
+        jit_fn(10)
+        jit_fn(10)
+
+        n = 500
+        n_runs = 10
+
+        start = time.perf_counter_ns()
+        for _ in range(n_runs):
+            py_fn(n)
+        cpython_ns = (time.perf_counter_ns() - start) / n_runs
+
+        start = time.perf_counter_ns()
+        for _ in range(n_runs):
+            jit_fn(n)
+        jit_ns = (time.perf_counter_ns() - start) / n_runs
+
+        speedup = cpython_ns / max(jit_ns, 1)
+        assert speedup > 30.0, f"Expected >30x speedup, got {speedup:.1f}x"
+
+
 class TestEndToEndJit:
     """Test the full @jit decorator pipeline."""
 

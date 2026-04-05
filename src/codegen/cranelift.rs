@@ -275,12 +275,7 @@ fn emit_icmp(
 }
 
 /// Compile a numeric loop to native code with proper Cranelift loop blocks.
-///
-/// Produces: fn(param0, param1, ...) -> i64 that runs:
-///   init locals from params and constants
-///   for counter in 0..limit:
-///       execute body_ops(counter, locals)
-///   return locals[return_local]
+/// Supports arbitrarily nested loops via LoopStart/LoopEnd markers in body_ops.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_loop(
     num_params: usize,
@@ -298,21 +293,20 @@ pub fn compile_loop(
     flag_builder.set("opt_level", "speed").map_err(|e| e.to_string())?;
     let isa_builder = cranelift_native::builder().map_err(|e| format!("host ISA: {e}"))?;
     let isa = isa_builder.finish(settings::Flags::new(flag_builder)).map_err(|e| e.to_string())?;
-    let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    let mut module = JITModule::new(builder);
+    let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut module = JITModule::new(jit_builder);
 
-    let cl_type_for = |type_id: u8| -> types::Type {
-        if type_id == 1 { types::F64 } else { types::I64 }
-    };
     let local_cl_type = |slot: usize| -> types::Type {
-        cl_type_for(*local_types.get(slot).unwrap_or(&0))
+        if *local_types.get(slot).unwrap_or(&0) == 1 { types::F64 } else { types::I64 }
     };
 
     let mut sig = module.make_signature();
     for i in 0..num_params {
-        sig.params.push(AbiParam::new(cl_type_for(*param_types_vec.get(i).unwrap_or(&0))));
+        let t = if *param_types_vec.get(i).unwrap_or(&0) == 1 { types::F64 } else { types::I64 };
+        sig.params.push(AbiParam::new(t));
     }
-    sig.returns.push(AbiParam::new(cl_type_for(return_type_id)));
+    let ret_cl = if return_type_id == 1 { types::F64 } else { types::I64 };
+    sig.returns.push(AbiParam::new(ret_cl));
 
     let func_id = module.declare_function("jit_loop", Linkage::Local, &sig).map_err(|e| e.to_string())?;
     let mut ctx = module.make_context();
@@ -326,7 +320,7 @@ pub fn compile_loop(
     let block_body = b.create_block();
     let block_exit = b.create_block();
 
-    // --- Entry block ---
+    // --- Entry ---
     b.append_block_params_for_function_params(block_entry);
     b.switch_to_block(block_entry);
     b.seal_block(block_entry);
@@ -334,7 +328,6 @@ pub fn compile_loop(
     let params: Vec<cranelift_codegen::ir::Value> = b.block_params(block_entry).to_vec();
     let limit = params[limit_param];
 
-    // Initialize locals with correct types
     let mut init_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
     for slot in 0..num_locals {
         let lt = local_cl_type(slot);
@@ -351,15 +344,13 @@ pub fn compile_loop(
     }
 
     let counter_init = b.ins().iconst(types::I64, 0);
-    let mut header_args: Vec<BlockArg> = vec![BlockArg::Value(counter_init)];
-    header_args.extend(init_vals.iter().map(|&v| BlockArg::Value(v)));
-    b.ins().jump(block_header, &header_args);
+    let mut args: Vec<BlockArg> = vec![BlockArg::Value(counter_init)];
+    args.extend(init_vals.iter().map(|&v| BlockArg::Value(v)));
+    b.ins().jump(block_header, &args);
 
-    // Loop header: [counter(i64), local0, local1, ...]
-    b.append_block_param(block_header, types::I64); // counter always i64
-    for slot in 0..num_locals {
-        b.append_block_param(block_header, local_cl_type(slot));
-    }
+    // --- Header ---
+    b.append_block_param(block_header, types::I64);
+    for slot in 0..num_locals { b.append_block_param(block_header, local_cl_type(slot)); }
     b.switch_to_block(block_header);
     let hp: Vec<cranelift_codegen::ir::Value> = b.block_params(block_header).to_vec();
     let counter = hp[0];
@@ -368,101 +359,25 @@ pub fn compile_loop(
     let cond = b.ins().icmp(IntCC::SignedLessThan, counter, limit);
     b.ins().brif(cond, block_body, &[], block_exit, &[]);
 
-    // --- Loop body ---
+    // --- Body (recursive, handles nested loops) ---
     b.switch_to_block(block_body);
     b.seal_block(block_body);
 
     let mut body_locals = header_locals.clone();
-    let counter_slot = usize::MAX;
-    // Comparison results stored separately (i8 type)
-    let mut cmp_results: HashMap<usize, cranelift_codegen::ir::Value> = HashMap::new();
+    emit_body_ops(&mut b, body_ops, &mut body_locals, counter, limit, &local_cl_type, num_locals);
 
-    for (kind, dst, src_a, src_b, is_b_imm, imm) in body_ops {
-        // Handle Select op specially: ("Select", dst, true_slot, false_slot, _, cmp_slot)
-        if kind == "Select" {
-            let cmp_slot = *imm as usize;
-            if let Some(&cond) = cmp_results.get(&cmp_slot) {
-                let true_val = if *src_a < body_locals.len() { body_locals[*src_a] }
-                    else if *src_a == counter_slot { counter }
-                    else { body_locals.get(*src_a).copied().unwrap_or(counter) };
-                let false_val = if *src_b < body_locals.len() { body_locals[*src_b] }
-                    else if *src_b == counter_slot { counter }
-                    else { body_locals.get(*src_b).copied().unwrap_or(counter) };
-                let selected = b.ins().select(cond, true_val, false_val);
-                if *dst < body_locals.len() {
-                    body_locals[*dst] = selected;
-                }
-            }
-            continue;
-        }
-
-        let dst_is_float = local_cl_type(*dst) == types::F64;
-
-        let a = if *src_a == counter_slot {
-            if dst_is_float { b.ins().fcvt_from_sint(types::F64, counter) } else { counter }
-        } else if *src_a < body_locals.len() {
-            body_locals[*src_a]
-        } else if dst_is_float {
-            b.ins().fcvt_from_sint(types::F64, counter)
-        } else {
-            counter
-        };
-
-        let bv = if *is_b_imm {
-            if dst_is_float { b.ins().f64const(f64::from_bits(*imm as u64)) } else { b.ins().iconst(types::I64, *imm) }
-        } else if *src_b == counter_slot {
-            if dst_is_float { b.ins().fcvt_from_sint(types::F64, counter) } else { counter }
-        } else if *src_b < body_locals.len() {
-            body_locals[*src_b]
-        } else if dst_is_float {
-            b.ins().fcvt_from_sint(types::F64, counter)
-        } else {
-            counter
-        };
-
-        let result = if dst_is_float {
-            match kind.as_str() {
-                "Add" => b.ins().fadd(a, bv),
-                "Sub" => b.ins().fsub(a, bv),
-                "Mul" => b.ins().fmul(a, bv),
-                "Div" | "TrueDiv" => b.ins().fdiv(a, bv),
-                _ => b.ins().fadd(a, bv),
-            }
-        } else {
-            match kind.as_str() {
-                "Add" => b.ins().iadd(a, bv),
-                "Sub" => b.ins().isub(a, bv),
-                "Mul" => b.ins().imul(a, bv),
-                "FloorDiv" => b.ins().sdiv(a, bv),
-                "Mod" => b.ins().srem(a, bv),
-                "CmpLt" => { let v = b.ins().icmp(IntCC::SignedLessThan, a, bv); cmp_results.insert(*dst, v); continue; }
-                "CmpLe" => { let v = b.ins().icmp(IntCC::SignedLessThanOrEqual, a, bv); cmp_results.insert(*dst, v); continue; }
-                "CmpEq" => { let v = b.ins().icmp(IntCC::Equal, a, bv); cmp_results.insert(*dst, v); continue; }
-                "CmpNe" => { let v = b.ins().icmp(IntCC::NotEqual, a, bv); cmp_results.insert(*dst, v); continue; }
-                "CmpGt" => { let v = b.ins().icmp(IntCC::SignedGreaterThan, a, bv); cmp_results.insert(*dst, v); continue; }
-                "CmpGe" => { let v = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, bv); cmp_results.insert(*dst, v); continue; }
-                _ => b.ins().iadd(a, bv),
-            }
-        };
-
-        if *dst < body_locals.len() {
-            body_locals[*dst] = result;
-        }
-    }
-
+    // Increment counter, jump back to header
     let one = b.ins().iconst(types::I64, 1);
     let counter_next = b.ins().iadd(counter, one);
-    let mut back_args: Vec<BlockArg> = vec![BlockArg::Value(counter_next)];
-    back_args.extend(body_locals.iter().map(|&v| BlockArg::Value(v)));
-    b.ins().jump(block_header, &back_args);
+    let mut back: Vec<BlockArg> = vec![BlockArg::Value(counter_next)];
+    back.extend(body_locals.iter().map(|&v| BlockArg::Value(v)));
+    b.ins().jump(block_header, &back);
 
-    // --- Exit block ---
+    // --- Exit ---
     b.switch_to_block(block_exit);
     b.seal_block(block_exit);
     b.seal_block(block_header);
-
-    let ret_val = header_locals[return_local];
-    b.ins().return_(&[ret_val]);
+    b.ins().return_(&[header_locals[return_local]]);
 
     b.finalize();
 
@@ -471,18 +386,203 @@ pub fn compile_loop(
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let fn_ptr = module.get_finalized_function(func_id);
 
-    let param_ir_types: Vec<IRType> = param_types_vec.iter().map(|&t| {
-        if t == 1 { IRType::Float64 } else { IRType::Int64 }
-    }).collect();
-    let ret_ir_type = if return_type_id == 1 { IRType::Float64 } else { IRType::Int64 };
+    let param_ir_types: Vec<IRType> = param_types_vec.iter().map(|&t| if t == 1 { IRType::Float64 } else { IRType::Int64 }).collect();
+    let ret_ir = if return_type_id == 1 { IRType::Float64 } else { IRType::Int64 };
 
-    Ok(CompiledCode {
-        _module: module,
-        fn_ptr,
-        num_params,
-        param_types: param_ir_types,
-        return_type: ret_ir_type,
-    })
+    Ok(CompiledCode { _module: module, fn_ptr, num_params, param_types: param_ir_types, return_type: ret_ir })
+}
+
+/// Recursively emit body ops, handling LoopStart/LoopEnd for nested loops.
+///
+/// LoopStart: ("LoopStart", limit_slot, iter_var_slot, 0, False, 0)
+///   — creates an inner loop header/body/exit, counter goes 0..locals[limit_slot]
+/// LoopEnd: ("LoopEnd", 0, 0, 0, False, 0)
+///   — closes the inner loop, resumes outer body
+fn emit_body_ops(
+    b: &mut FunctionBuilder,
+    ops: &[(String, usize, usize, usize, bool, i64)],
+    locals: &mut [cranelift_codegen::ir::Value],
+    counter: cranelift_codegen::ir::Value,
+    limit: cranelift_codegen::ir::Value,
+    local_cl_type: &dyn Fn(usize) -> types::Type,
+    num_locals: usize,
+) {
+    let counter_slot = usize::MAX;
+    let mut cmp_results: HashMap<usize, cranelift_codegen::ir::Value> = HashMap::new();
+    let mut i = 0;
+
+    while i < ops.len() {
+        let (ref kind, dst, src_a, src_b, is_b_imm, imm) = ops[i];
+
+        if kind == "LoopStart" {
+            // dst = limit_slot (which local holds the inner loop's limit)
+            // src_a = inner iter_var_slot (not used in compiled code — counter is separate)
+            let inner_limit = if dst < locals.len() { locals[dst] } else { limit };
+
+            // Find matching LoopEnd
+            let inner_end = find_loop_end(ops, i);
+            let inner_ops = &ops[i + 1..inner_end];
+
+            // Create inner loop blocks
+            let inner_header = b.create_block();
+            let inner_body = b.create_block();
+            let inner_exit = b.create_block();
+
+            // Init inner counter, jump to inner header
+            let inner_counter_init = b.ins().iconst(types::I64, 0);
+            let mut jump_args: Vec<BlockArg> = vec![BlockArg::Value(inner_counter_init)];
+            jump_args.extend(locals.iter().map(|&v| BlockArg::Value(v)));
+            b.ins().jump(inner_header, &jump_args);
+
+            // Inner header: [inner_counter, locals...]
+            b.append_block_param(inner_header, types::I64);
+            for slot in 0..num_locals { b.append_block_param(inner_header, local_cl_type(slot)); }
+            b.switch_to_block(inner_header);
+            let ihp: Vec<cranelift_codegen::ir::Value> = b.block_params(inner_header).to_vec();
+            let inner_counter = ihp[0];
+            let inner_locals: Vec<cranelift_codegen::ir::Value> = ihp[1..].to_vec();
+
+            let inner_cond = b.ins().icmp(IntCC::SignedLessThan, inner_counter, inner_limit);
+            // When inner loop exits, pass current locals to exit block
+            let exit_args: Vec<BlockArg> = inner_locals.iter().map(|&v| BlockArg::Value(v)).collect();
+            b.ins().brif(inner_cond, inner_body, &[], inner_exit, &exit_args);
+
+            // Inner body
+            b.switch_to_block(inner_body);
+            b.seal_block(inner_body);
+
+            let mut inner_body_locals = inner_locals.clone();
+            // Store inner counter into its iter var slot so nested loops can reference it
+            let inner_iter_slot = src_a; // LoopStart encodes iter_var_slot in src_a
+            if inner_iter_slot < inner_body_locals.len() {
+                inner_body_locals[inner_iter_slot] = inner_counter;
+            }
+            // RECURSE: process inner ops (may contain more LoopStart/LoopEnd)
+            emit_body_ops(b, inner_ops, &mut inner_body_locals, inner_counter, inner_limit, local_cl_type, num_locals);
+
+            // Increment inner counter, jump back
+            let one = b.ins().iconst(types::I64, 1);
+            let inner_next = b.ins().iadd(inner_counter, one);
+            let mut inner_back: Vec<BlockArg> = vec![BlockArg::Value(inner_next)];
+            inner_back.extend(inner_body_locals.iter().map(|&v| BlockArg::Value(v)));
+            b.ins().jump(inner_header, &inner_back);
+
+            // Inner exit: locals flow out to continue the outer body
+            // The inner_exit block receives locals from inner_header when loop is done
+            for slot in 0..num_locals { b.append_block_param(inner_exit, local_cl_type(slot)); }
+            b.switch_to_block(inner_exit);
+            b.seal_block(inner_exit);
+            b.seal_block(inner_header);
+
+            // Update outer locals from inner exit block params
+            let exit_params: Vec<cranelift_codegen::ir::Value> = b.block_params(inner_exit).to_vec();
+            for (slot, &val) in exit_params.iter().enumerate() {
+                if slot < locals.len() {
+                    locals[slot] = val;
+                }
+            }
+
+            i = inner_end + 1;
+            continue;
+        }
+
+        if kind == "StoreCounter" {
+            // Store the current loop's counter into a local slot
+            if dst < locals.len() {
+                locals[dst] = counter;
+            }
+            i += 1;
+            continue;
+        }
+
+        if kind == "LoopEnd" {
+            // Should not reach here — LoopEnd is consumed by LoopStart processing
+            i += 1;
+            continue;
+        }
+
+        // Handle Select
+        if kind == "Select" {
+            let cmp_slot = imm as usize;
+            if let Some(&cond_val) = cmp_results.get(&cmp_slot) {
+                let tv = if src_a < locals.len() { locals[src_a] } else { counter };
+                let fv = if src_b < locals.len() { locals[src_b] } else { counter };
+                let sel = b.ins().select(cond_val, tv, fv);
+                if dst < locals.len() { locals[dst] = sel; }
+            }
+            i += 1;
+            continue;
+        }
+
+        // Regular arithmetic/comparison op
+        let dst_is_float = local_cl_type(dst) == types::F64;
+
+        let a = if src_a == counter_slot {
+            if dst_is_float { b.ins().fcvt_from_sint(types::F64, counter) } else { counter }
+        } else if src_a < locals.len() {
+            locals[src_a]
+        } else { counter };
+
+        let bv = if is_b_imm {
+            if dst_is_float { b.ins().f64const(f64::from_bits(imm as u64)) } else { b.ins().iconst(types::I64, imm) }
+        } else if src_b == counter_slot {
+            if dst_is_float { b.ins().fcvt_from_sint(types::F64, counter) } else { counter }
+        } else if src_b < locals.len() {
+            locals[src_b]
+        } else { counter };
+
+        if dst_is_float {
+            let result = match kind.as_str() {
+                "Add" => b.ins().fadd(a, bv),
+                "Sub" => b.ins().fsub(a, bv),
+                "Mul" => b.ins().fmul(a, bv),
+                "Div" | "TrueDiv" => b.ins().fdiv(a, bv),
+                _ => b.ins().fadd(a, bv),
+            };
+            if dst < locals.len() { locals[dst] = result; }
+        } else {
+            match kind.as_str() {
+                "CmpLt" | "CmpLe" | "CmpEq" | "CmpNe" | "CmpGt" | "CmpGe" => {
+                    let cc = match kind.as_str() {
+                        "CmpLt" => IntCC::SignedLessThan,
+                        "CmpLe" => IntCC::SignedLessThanOrEqual,
+                        "CmpEq" => IntCC::Equal,
+                        "CmpNe" => IntCC::NotEqual,
+                        "CmpGt" => IntCC::SignedGreaterThan,
+                        _ => IntCC::SignedGreaterThanOrEqual,
+                    };
+                    let v = b.ins().icmp(cc, a, bv);
+                    cmp_results.insert(dst, v);
+                }
+                _ => {
+                    let result = match kind.as_str() {
+                        "Add" => b.ins().iadd(a, bv),
+                        "Sub" => b.ins().isub(a, bv),
+                        "Mul" => b.ins().imul(a, bv),
+                        "FloorDiv" => b.ins().sdiv(a, bv),
+                        "Mod" => b.ins().srem(a, bv),
+                        _ => b.ins().iadd(a, bv),
+                    };
+                    if dst < locals.len() { locals[dst] = result; }
+                }
+            }
+        }
+
+        i += 1;
+    }
+}
+
+/// Find the matching LoopEnd for a LoopStart at position `start`.
+fn find_loop_end(ops: &[(String, usize, usize, usize, bool, i64)], start: usize) -> usize {
+    let mut depth = 0;
+    for (j, op) in ops.iter().enumerate().skip(start) {
+        if op.0 == "LoopStart" { depth += 1; }
+        if op.0 == "LoopEnd" {
+            depth -= 1;
+            if depth == 0 { return j; }
+        }
+    }
+    ops.len() // fallback
 }
 
 fn determine_return_type(program: &IRProgram) -> IRType {
