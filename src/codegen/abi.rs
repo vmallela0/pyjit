@@ -9,9 +9,6 @@ use crate::ir::types::IRType;
 use super::cranelift::{compile, compile_loop, CompiledCode};
 
 /// A compiled function that can be called from Python.
-///
-/// Wraps native code produced by Cranelift. Handles argument extraction
-/// (PyObject → native) and result boxing (native → PyObject).
 #[pyclass(unsendable)]
 pub struct CompiledFunction {
     code: CompiledCode,
@@ -27,126 +24,117 @@ impl CompiledFunction {
         )
     }
 
-    /// Call the compiled native function with Python arguments.
     #[pyo3(signature = (*args))]
     fn __call__(&self, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
         if args.len() != self.code.num_params {
             return Err(pyo3::exceptions::PyTypeError::new_err(format!(
                 "{}() takes {} arguments, got {}",
-                self.func_name,
-                self.code.num_params,
-                args.len()
+                self.func_name, self.code.num_params, args.len()
             )));
         }
 
-        // Extract arguments to native types
-        let mut i64_args: Vec<i64> = Vec::new();
-        let mut f64_args: Vec<f64> = Vec::new();
-        let all_int = self.code.param_types.iter().all(|t| *t == IRType::Int64);
-        let all_float = self.code.param_types.iter().all(|t| *t == IRType::Float64);
+        // Extract arguments to raw u64 buffer (both i64 and f64 fit in 8 bytes)
+        let mut raw_args: Vec<u64> = Vec::with_capacity(self.code.num_params);
+        for (i, ty) in self.code.param_types.iter().enumerate() {
+            match ty {
+                IRType::Int64 => {
+                    let val: i64 = args.get_item(i)?.extract()?;
+                    raw_args.push(val as u64);
+                }
+                IRType::Float64 => {
+                    let val: f64 = args.get_item(i)?.extract()?;
+                    raw_args.push(val.to_bits());
+                }
+                _ => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "Unsupported parameter type",
+                    ));
+                }
+            }
+        }
 
-        if all_int {
-            for (i, ty) in self.code.param_types.iter().enumerate() {
-                match ty {
-                    IRType::Int64 => {
-                        let val: i64 = args.get_item(i)?.extract()?;
-                        i64_args.push(val);
-                    }
-                    _ => unreachable!(),
-                }
+        let result_raw = self.call_raw(&raw_args);
+
+        match self.code.return_type {
+            IRType::Float64 => {
+                let val = f64::from_bits(result_raw);
+                Ok(val.into_pyobject(py)?.into_any().unbind())
             }
-            let result = self.call_int_fn(&i64_args);
-            Ok(result.into_pyobject(py)?.into_any().unbind())
-        } else if all_float {
-            for (i, ty) in self.code.param_types.iter().enumerate() {
-                match ty {
-                    IRType::Float64 => {
-                        let val: f64 = args.get_item(i)?.extract()?;
-                        f64_args.push(val);
-                    }
-                    _ => unreachable!(),
-                }
+            _ => {
+                let val = result_raw as i64;
+                Ok(val.into_pyobject(py)?.into_any().unbind())
             }
-            let result = self.call_float_fn(&f64_args);
-            Ok(result.into_pyobject(py)?.into_any().unbind())
-        } else {
-            // Mixed types — fall back to interpreting
-            Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Mixed parameter types not yet supported in JIT",
-            ))
         }
     }
 }
 
 impl CompiledFunction {
-    /// Call the native function with i64 arguments.
-    fn call_int_fn(&self, args: &[i64]) -> i64 {
+    fn call_raw(&self, args: &[u64]) -> u64 {
+        let all_int = self.code.param_types.iter().all(|t| *t == IRType::Int64);
+        let ret_float = self.code.return_type == IRType::Float64;
+
+        if all_int && !ret_float {
+            self.call_int_fn(args) as u64
+        } else if all_int && ret_float {
+            self.call_int_ret_float(args).to_bits()
+        } else {
+            self.call_mixed(args)
+        }
+    }
+
+    #[allow(clippy::missing_transmute_annotations)]
+    fn call_int_fn(&self, args: &[u64]) -> i64 {
         let ptr = self.code.fn_ptr;
+        let a = |i: usize| args[i] as i64;
         unsafe {
             match args.len() {
-                0 => {
-                    let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(ptr);
-                    f()
-                }
-                1 => {
-                    let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(ptr);
-                    f(args[0])
-                }
-                2 => {
-                    let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(ptr);
-                    f(args[0], args[1])
-                }
-                3 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(ptr);
-                    f(args[0], args[1], args[2])
-                }
-                4 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
-                        std::mem::transmute(ptr);
-                    f(args[0], args[1], args[2], args[3])
-                }
-                5 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
-                        std::mem::transmute(ptr);
-                    f(args[0], args[1], args[2], args[3], args[4])
-                }
-                6 => {
-                    let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
-                        std::mem::transmute(ptr);
-                    f(args[0], args[1], args[2], args[3], args[4], args[5])
-                }
-                _ => panic!("too many arguments (max 6)"),
+                0 => std::mem::transmute::<_, unsafe extern "C" fn() -> i64>(ptr)(),
+                1 => std::mem::transmute::<_, unsafe extern "C" fn(i64) -> i64>(ptr)(a(0)),
+                2 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64) -> i64>(ptr)(a(0), a(1)),
+                3 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2)),
+                4 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3)),
+                5 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4)),
+                6 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64>(ptr)(a(0), a(1), a(2), a(3), a(4), a(5)),
+                _ => panic!("too many int arguments (max 6)"),
             }
         }
     }
 
-    /// Call the native function with f64 arguments.
-    fn call_float_fn(&self, args: &[f64]) -> f64 {
+    #[allow(clippy::missing_transmute_annotations)]
+    fn call_int_ret_float(&self, args: &[u64]) -> f64 {
         let ptr = self.code.fn_ptr;
+        let a = |i: usize| args[i] as i64;
         unsafe {
             match args.len() {
-                0 => {
-                    let f: unsafe extern "C" fn() -> f64 = std::mem::transmute(ptr);
-                    f()
+                0 => std::mem::transmute::<_, unsafe extern "C" fn() -> f64>(ptr)(),
+                1 => std::mem::transmute::<_, unsafe extern "C" fn(i64) -> f64>(ptr)(a(0)),
+                2 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64) -> f64>(ptr)(a(0), a(1)),
+                3 => std::mem::transmute::<_, unsafe extern "C" fn(i64, i64, i64) -> f64>(ptr)(a(0), a(1), a(2)),
+                _ => panic!("too many args for int->float signature (max 3)"),
+            }
+        }
+    }
+
+    #[allow(clippy::missing_transmute_annotations)]
+    fn call_mixed(&self, args: &[u64]) -> u64 {
+        let ptr = self.code.fn_ptr;
+        let types = &self.code.param_types;
+        let ret_float = self.code.return_type == IRType::Float64;
+        unsafe {
+            match (args.len(), ret_float) {
+                (1, true) if types[0] == IRType::Int64 => {
+                    std::mem::transmute::<_, unsafe extern "C" fn(i64) -> f64>(ptr)(args[0] as i64).to_bits()
                 }
-                1 => {
-                    let f: unsafe extern "C" fn(f64) -> f64 = std::mem::transmute(ptr);
-                    f(args[0])
+                (1, false) if types[0] == IRType::Float64 => {
+                    std::mem::transmute::<_, unsafe extern "C" fn(f64) -> i64>(ptr)(f64::from_bits(args[0])) as u64
                 }
-                2 => {
-                    let f: unsafe extern "C" fn(f64, f64) -> f64 = std::mem::transmute(ptr);
-                    f(args[0], args[1])
+                (2, true) if types[0] == IRType::Int64 && types[1] == IRType::Int64 => {
+                    std::mem::transmute::<_, unsafe extern "C" fn(i64, i64) -> f64>(ptr)(args[0] as i64, args[1] as i64).to_bits()
                 }
-                3 => {
-                    let f: unsafe extern "C" fn(f64, f64, f64) -> f64 = std::mem::transmute(ptr);
-                    f(args[0], args[1], args[2])
+                (2, false) if types[0] == IRType::Float64 && types[1] == IRType::Float64 => {
+                    std::mem::transmute::<_, unsafe extern "C" fn(f64, f64) -> f64>(ptr)(f64::from_bits(args[0]), f64::from_bits(args[1])).to_bits()
                 }
-                4 => {
-                    let f: unsafe extern "C" fn(f64, f64, f64, f64) -> f64 =
-                        std::mem::transmute(ptr);
-                    f(args[0], args[1], args[2], args[3])
-                }
-                _ => panic!("too many float arguments (max 4)"),
+                _ => 0, // unsupported — Python guard should prevent reaching here
             }
         }
     }
@@ -163,24 +151,20 @@ pub fn compile_ir(program: &IRProgram, func_name: Option<String>) -> PyResult<Co
 }
 
 /// Compile a loop function with native loop blocks for maximum performance.
-///
-/// # Arguments
-/// * `num_params` — number of function parameters
-/// * `limit_param` — index of the param that is the loop limit
-/// * `num_locals` — total local variable slots
-/// * `return_local` — which local to return
-/// * `init_locals` — list of (slot, initial_value) for non-param locals
-/// * `body_ops` — list of (kind, dst, src_a, src_b, is_b_imm, imm_val) tuples
-/// * `func_name` — optional name for debugging
 #[pyfunction]
-#[pyo3(signature = (num_params, limit_param, num_locals, return_local, init_locals, body_ops, func_name=None))]
+#[pyo3(signature = (num_params, limit_param, num_locals, return_local, init_locals, init_float_locals, body_ops, local_types, param_types, return_type_id, func_name=None))]
+#[allow(clippy::too_many_arguments)]
 pub fn compile_loop_ir(
     num_params: usize,
     limit_param: usize,
     num_locals: usize,
     return_local: usize,
     init_locals: Vec<(usize, i64)>,
+    init_float_locals: Vec<(usize, f64)>,
     body_ops: Vec<(String, usize, usize, usize, bool, i64)>,
+    local_types: Vec<u8>,
+    param_types: Vec<u8>,
+    return_type_id: u8,
     func_name: Option<String>,
 ) -> PyResult<CompiledFunction> {
     let code = compile_loop(
@@ -189,7 +173,11 @@ pub fn compile_loop_ir(
         num_locals,
         return_local,
         &init_locals,
+        &init_float_locals,
         &body_ops,
+        &local_types,
+        &param_types,
+        return_type_id,
     )
     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 

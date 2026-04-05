@@ -113,6 +113,10 @@ def compile_loop_ir(
     num_locals: int,
     return_local: int,
     init_locals: list[tuple[int, int]],
+    init_float_locals: list[tuple[int, float]],
     body_ops: list[tuple[str, int, int, int, bool, int]],
+    local_types: list[int],
+    param_types: list[int],
+    return_type_id: int,
     func_name: str | None = None,
 ) -> CompiledFunction: ...

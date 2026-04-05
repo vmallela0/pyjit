@@ -1,10 +1,19 @@
-"""Tests for Cranelift codegen — Phase 2."""
+"""Tests for Cranelift codegen — Phase 2+."""
 
 from __future__ import annotations
+
+import struct
 
 from pyjit._pyjit import build_ir, compile_ir, compile_loop_ir, trace_function
 
 COUNTER = 2**64 - 1  # usize::MAX sentinel for loop counter
+TYPE_I64 = 0
+TYPE_F64 = 1
+
+
+def _f64_bits(v: float) -> int:
+    """Encode a float as i64 bits for passing as immediate."""
+    return struct.unpack("<q", struct.pack("<d", v))[0]
 
 
 class TestSimpleCompilation:
@@ -77,7 +86,11 @@ class TestLoopCompilation:
             num_locals=3,
             return_local=1,
             init_locals=[(1, 0)],
+            init_float_locals=[],
             body_ops=[("Add", 1, 1, COUNTER, False, 0)],
+            local_types=[TYPE_I64, TYPE_I64, TYPE_I64],
+            param_types=[TYPE_I64],
+            return_type_id=TYPE_I64,
             func_name="sum_range",
         )
         assert jit_fn(0) == 0
@@ -92,10 +105,14 @@ class TestLoopCompilation:
             num_locals=4,
             return_local=1,
             init_locals=[(1, 0), (2, 0), (3, 0)],
+            init_float_locals=[],
             body_ops=[
                 ("Mul", 3, COUNTER, COUNTER, False, 0),
                 ("Add", 1, 1, 3, False, 0),
             ],
+            local_types=[TYPE_I64] * 4,
+            param_types=[TYPE_I64],
+            return_type_id=TYPE_I64,
             func_name="sum_squares",
         )
         assert jit_fn(0) == 0
@@ -110,9 +127,88 @@ class TestLoopCompilation:
             num_locals=3,
             return_local=1,
             init_locals=[(1, 0)],
+            init_float_locals=[],
             body_ops=[("Add", 1, 1, COUNTER, False, 0)],
+            local_types=[TYPE_I64] * 3,
+            param_types=[TYPE_I64],
+            return_type_id=TYPE_I64,
         )
         assert jit_fn(1_000_000) == 499999500000
+
+
+class TestFloatLoopCompilation:
+    """Test float loop compilation — Task 1."""
+
+    def test_float_accumulate_const(self) -> None:
+        """s += 1.5 in a loop."""
+        jit_fn = compile_loop_ir(
+            num_params=1,
+            limit_param=0,
+            num_locals=3,
+            return_local=1,
+            init_locals=[],
+            init_float_locals=[(1, 0.0)],
+            body_ops=[("Add", 1, 1, 0, True, _f64_bits(1.5))],
+            local_types=[TYPE_I64, TYPE_F64, TYPE_I64],
+            param_types=[TYPE_I64],
+            return_type_id=TYPE_F64,
+        )
+        assert abs(jit_fn(100) - 150.0) < 1e-9
+
+    def test_float_counter_accumulate(self) -> None:
+        """s += float(counter) in a loop — counter converted to f64."""
+        jit_fn = compile_loop_ir(
+            num_params=1,
+            limit_param=0,
+            num_locals=3,
+            return_local=1,
+            init_locals=[],
+            init_float_locals=[(1, 0.0)],
+            body_ops=[("Add", 1, 1, COUNTER, False, 0)],
+            local_types=[TYPE_I64, TYPE_F64, TYPE_I64],
+            param_types=[TYPE_I64],
+            return_type_id=TYPE_F64,
+        )
+        assert abs(jit_fn(10) - 45.0) < 1e-9
+        assert abs(jit_fn(100) - 4950.0) < 1e-9
+
+    def test_float_mul(self) -> None:
+        """s += counter * counter as float."""
+        jit_fn = compile_loop_ir(
+            num_params=1,
+            limit_param=0,
+            num_locals=4,
+            return_local=1,
+            init_locals=[],
+            init_float_locals=[(1, 0.0), (3, 0.0)],
+            body_ops=[
+                ("Mul", 3, COUNTER, COUNTER, False, 0),
+                ("Add", 1, 1, 3, False, 0),
+            ],
+            local_types=[TYPE_I64, TYPE_F64, TYPE_I64, TYPE_F64],
+            param_types=[TYPE_I64],
+            return_type_id=TYPE_F64,
+        )
+        expected = sum(float(i) * float(i) for i in range(100))
+        assert abs(jit_fn(100) - expected) < 1e-6
+
+    def test_jit_float_accumulator(self) -> None:
+        """End-to-end @jit test with float accumulator."""
+        from pyjit import jit
+        from pyjit.inspect import is_jit_compiled
+
+        @jit(warmup=2)
+        def fn(n: int) -> float:
+            s = 0.0
+            for i in range(n):
+                s += 1.5
+            return s
+
+        fn(10)
+        fn(10)
+        assert is_jit_compiled(fn)
+        assert abs(fn(100) - 150.0) < 1e-9
+        assert abs(fn(1000) - 1500.0) < 1e-6
 
 
 class TestEndToEndJit:
@@ -128,11 +224,9 @@ class TestEndToEndJit:
                 total += i * i
             return total
 
-        # Warm up
         for _ in range(5):
             sum_squares(10)
 
-        # Verify compiled version
         assert sum_squares(0) == 0
         assert sum_squares(5) == 30
         assert sum_squares(100) == 328350

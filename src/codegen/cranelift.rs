@@ -281,13 +281,18 @@ fn emit_icmp(
 ///   for counter in 0..limit:
 ///       execute body_ops(counter, locals)
 ///   return locals[return_local]
+#[allow(clippy::too_many_arguments)]
 pub fn compile_loop(
     num_params: usize,
     limit_param: usize,
     num_locals: usize,
     return_local: usize,
     init_locals: &[(usize, i64)],
-    body_ops: &[(String, usize, usize, usize, bool, i64)], // (kind, dst, src_a, src_b, is_b_imm, imm)
+    init_float_locals: &[(usize, f64)],
+    body_ops: &[(String, usize, usize, usize, bool, i64)],
+    local_types: &[u8],
+    param_types_vec: &[u8],
+    return_type_id: u8,
 ) -> Result<CompiledCode, String> {
     let mut flag_builder = settings::builder();
     flag_builder.set("opt_level", "speed").map_err(|e| e.to_string())?;
@@ -296,11 +301,18 @@ pub fn compile_loop(
     let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     let mut module = JITModule::new(builder);
 
+    let cl_type_for = |type_id: u8| -> types::Type {
+        if type_id == 1 { types::F64 } else { types::I64 }
+    };
+    let local_cl_type = |slot: usize| -> types::Type {
+        cl_type_for(*local_types.get(slot).unwrap_or(&0))
+    };
+
     let mut sig = module.make_signature();
-    for _ in 0..num_params {
-        sig.params.push(AbiParam::new(types::I64));
+    for i in 0..num_params {
+        sig.params.push(AbiParam::new(cl_type_for(*param_types_vec.get(i).unwrap_or(&0))));
     }
-    sig.returns.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(cl_type_for(return_type_id)));
 
     let func_id = module.declare_function("jit_loop", Linkage::Local, &sig).map_err(|e| e.to_string())?;
     let mut ctx = module.make_context();
@@ -322,11 +334,15 @@ pub fn compile_loop(
     let params: Vec<cranelift_codegen::ir::Value> = b.block_params(block_entry).to_vec();
     let limit = params[limit_param];
 
-    // Initialize local values
+    // Initialize locals with correct types
     let mut init_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
     for slot in 0..num_locals {
+        let lt = local_cl_type(slot);
         let val = if slot < params.len() {
             params[slot]
+        } else if lt == types::F64 {
+            let v = init_float_locals.iter().find(|&&(s, _)| s == slot).map(|&(_, v)| v).unwrap_or(0.0);
+            b.ins().f64const(v)
         } else {
             let v = init_locals.iter().find(|&&(s, _)| s == slot).map(|&(_, v)| v).unwrap_or(0);
             b.ins().iconst(types::I64, v)
@@ -339,9 +355,10 @@ pub fn compile_loop(
     header_args.extend(init_vals.iter().map(|&v| BlockArg::Value(v)));
     b.ins().jump(block_header, &header_args);
 
-    // --- Loop header: [counter, local0, local1, ...] ---
-    for _ in 0..1 + num_locals {
-        b.append_block_param(block_header, types::I64);
+    // Loop header: [counter(i64), local0, local1, ...]
+    b.append_block_param(block_header, types::I64); // counter always i64
+    for slot in 0..num_locals {
+        b.append_block_param(block_header, local_cl_type(slot));
     }
     b.switch_to_block(block_header);
     let hp: Vec<cranelift_codegen::ir::Value> = b.block_params(block_header).to_vec();
@@ -359,24 +376,47 @@ pub fn compile_loop(
     let counter_slot = usize::MAX; // sentinel
 
     for (kind, dst, src_a, src_b, is_b_imm, imm) in body_ops {
-        let a = if *src_a == counter_slot { counter } else if *src_a < body_locals.len() { body_locals[*src_a] } else { counter };
-        let bv = if *is_b_imm {
-            b.ins().iconst(types::I64, *imm)
-        } else if *src_b == counter_slot {
-            counter
-        } else if *src_b < body_locals.len() {
-            body_locals[*src_b]
+        let dst_is_float = local_cl_type(*dst) == types::F64;
+
+        let a = if *src_a == counter_slot {
+            if dst_is_float { b.ins().fcvt_from_sint(types::F64, counter) } else { counter }
+        } else if *src_a < body_locals.len() {
+            body_locals[*src_a]
+        } else if dst_is_float {
+            b.ins().fcvt_from_sint(types::F64, counter)
         } else {
             counter
         };
 
-        let result = match kind.as_str() {
-            "Add" => b.ins().iadd(a, bv),
-            "Sub" => b.ins().isub(a, bv),
-            "Mul" => b.ins().imul(a, bv),
-            "FloorDiv" => b.ins().sdiv(a, bv),
-            "Mod" => b.ins().srem(a, bv),
-            _ => b.ins().iadd(a, bv),
+        let bv = if *is_b_imm {
+            if dst_is_float { b.ins().f64const(f64::from_bits(*imm as u64)) } else { b.ins().iconst(types::I64, *imm) }
+        } else if *src_b == counter_slot {
+            if dst_is_float { b.ins().fcvt_from_sint(types::F64, counter) } else { counter }
+        } else if *src_b < body_locals.len() {
+            body_locals[*src_b]
+        } else if dst_is_float {
+            b.ins().fcvt_from_sint(types::F64, counter)
+        } else {
+            counter
+        };
+
+        let result = if dst_is_float {
+            match kind.as_str() {
+                "Add" => b.ins().fadd(a, bv),
+                "Sub" => b.ins().fsub(a, bv),
+                "Mul" => b.ins().fmul(a, bv),
+                "Div" | "TrueDiv" => b.ins().fdiv(a, bv),
+                _ => b.ins().fadd(a, bv),
+            }
+        } else {
+            match kind.as_str() {
+                "Add" => b.ins().iadd(a, bv),
+                "Sub" => b.ins().isub(a, bv),
+                "Mul" => b.ins().imul(a, bv),
+                "FloorDiv" => b.ins().sdiv(a, bv),
+                "Mod" => b.ins().srem(a, bv),
+                _ => b.ins().iadd(a, bv),
+            }
         };
 
         if *dst < body_locals.len() {
@@ -405,12 +445,17 @@ pub fn compile_loop(
     module.finalize_definitions().map_err(|e| e.to_string())?;
     let fn_ptr = module.get_finalized_function(func_id);
 
+    let param_ir_types: Vec<IRType> = param_types_vec.iter().map(|&t| {
+        if t == 1 { IRType::Float64 } else { IRType::Int64 }
+    }).collect();
+    let ret_ir_type = if return_type_id == 1 { IRType::Float64 } else { IRType::Int64 };
+
     Ok(CompiledCode {
         _module: module,
         fn_ptr,
         num_params,
-        param_types: vec![IRType::Int64; num_params],
-        return_type: IRType::Int64,
+        param_types: param_ir_types,
+        return_type: ret_ir_type,
     })
 }
 
