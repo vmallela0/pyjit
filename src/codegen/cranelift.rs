@@ -379,6 +379,11 @@ pub fn compile_loop(
     let block_body = b.create_block();
     let block_exit = b.create_block();
 
+    // block_exit has params for all locals so BreakIf can pass current state
+    for slot in 0..num_locals {
+        b.append_block_param(block_exit, local_cl_type(slot));
+    }
+
     // --- Entry: unpack args from the *const u64 buffer ---
     b.append_block_params_for_function_params(block_entry);
     b.switch_to_block(block_entry);
@@ -429,7 +434,8 @@ pub fn compile_loop(
     let header_locals: Vec<cranelift_codegen::ir::Value> = hp[1..].to_vec();
 
     let cond = b.ins().icmp(IntCC::SignedLessThan, counter, limit);
-    b.ins().brif(cond, block_body, &[], block_exit, &[]);
+    let exit_args_hdr: Vec<BlockArg> = header_locals.iter().map(|&v| BlockArg::Value(v)).collect();
+    b.ins().brif(cond, block_body, &[], block_exit, &exit_args_hdr);
 
     // --- Body (recursive, handles nested loops) ---
     b.switch_to_block(block_body);
@@ -444,7 +450,7 @@ pub fn compile_loop(
     };
 
     let mut body_locals = header_locals.clone();
-    emit_body_ops(&mut b, body_ops, &mut body_locals, counter, limit, &local_cl_type, num_locals, &rt);
+    emit_body_ops(&mut b, body_ops, &mut body_locals, counter, limit, block_exit, &local_cl_type, num_locals, &rt);
 
     // Increment counter by step, jump back to header
     let step = b.ins().iconst(types::I64, step_value);
@@ -457,7 +463,12 @@ pub fn compile_loop(
     b.switch_to_block(block_exit);
     b.seal_block(block_exit);
     b.seal_block(block_header);
-    let ret_val = header_locals[return_local];
+    let exit_params: Vec<cranelift_codegen::ir::Value> = b.block_params(block_exit).to_vec();
+    let ret_val = if return_local < exit_params.len() {
+        exit_params[return_local]
+    } else {
+        b.ins().iconst(types::I64, 0)
+    };
     let ret_bits = if return_type_id == 1 {
         // f64 return: reinterpret as i64 bits
         b.ins().bitcast(types::I64, MemFlags::new(), ret_val)
@@ -492,6 +503,7 @@ fn emit_body_ops(
     locals: &mut [cranelift_codegen::ir::Value],
     counter: cranelift_codegen::ir::Value,
     limit: cranelift_codegen::ir::Value,
+    block_exit: cranelift_codegen::ir::Block,
     local_cl_type: &dyn Fn(usize) -> types::Type,
     num_locals: usize,
     rt: &RuntimeRefs,
@@ -549,7 +561,7 @@ fn emit_body_ops(
                 inner_body_locals[inner_iter_slot] = inner_counter;
             }
             // RECURSE: process inner ops (may contain more LoopStart/LoopEnd)
-            emit_body_ops(b, inner_ops, &mut inner_body_locals, inner_counter, inner_limit, local_cl_type, num_locals, rt);
+            emit_body_ops(b, inner_ops, &mut inner_body_locals, inner_counter, inner_limit, inner_exit, local_cl_type, num_locals, rt);
 
             // Increment inner counter, jump back
             let one = b.ins().iconst(types::I64, 1);
@@ -670,6 +682,29 @@ fn emit_body_ops(
 
         if kind == "LoopEnd" {
             // Should not reach here — LoopEnd is consumed by LoopStart processing
+            i += 1;
+            continue;
+        }
+
+        if kind == "BreakIf" {
+            // dst = cmp_slot, src_a = invert (0 = exit if true, 1 = exit if false)
+            let cond_val = cmp_results.get(&dst).copied()
+                .unwrap_or_else(|| b.ins().iconst(types::I8, 0));
+            let invert = src_a != 0;
+
+            let continue_block = b.create_block();
+            let exit_args: Vec<BlockArg> = locals.iter().map(|&v| BlockArg::Value(v)).collect();
+
+            if invert {
+                // Exit if cond is false (0)
+                b.ins().brif(cond_val, continue_block, &[], block_exit, &exit_args);
+            } else {
+                // Exit if cond is true (1)
+                b.ins().brif(cond_val, block_exit, &exit_args, continue_block, &[]);
+            }
+
+            b.switch_to_block(continue_block);
+            b.seal_block(continue_block);
             i += 1;
             continue;
         }

@@ -18,7 +18,7 @@ def jit(fn: F) -> F: ...
 
 
 @overload
-def jit(*, warmup: int = 10, eager: bool = False) -> Callable[[F], F]: ...
+def jit(*, warmup: int = 10, eager: bool = False, explain: bool = False) -> Callable[[F], F]: ...
 
 
 def jit(
@@ -26,14 +26,18 @@ def jit(
     *,
     warmup: int = 10,
     eager: bool = False,
+    explain: bool = False,
 ) -> F | Callable[[F], F]:
     """Mark a function for JIT compilation.
 
-    Can be used as ``@jit``, ``@jit(warmup=10)``, or ``@jit(eager=True)``.
+    Can be used as ``@jit``, ``@jit(warmup=10)``, ``@jit(eager=True)``,
+    or ``@jit(explain=True)``.
 
     After ``warmup`` interpreted calls, the function is traced, compiled
     to native code via Cranelift, and subsequent calls execute natively.
     With ``eager=True``, compilation is attempted on the very first call.
+    With ``explain=True``, prints a diagnostic report explaining why
+    compilation succeeded or failed — useful for debugging.
     If the compiled code's type assumptions are violated (different types,
     None values, bigint overflow), execution gracefully falls back to CPython.
 
@@ -41,6 +45,7 @@ def jit(
         fn: The function to decorate (when used as bare ``@jit``).
         warmup: Number of interpreted calls before compilation triggers.
         eager: If True, compile on the first call instead of after warmup.
+        explain: If True, print compilation diagnostics to stdout.
 
     Returns:
         The decorated function.
@@ -76,7 +81,7 @@ def jit(
                 (eager and call_count == 1) or (not eager and call_count == warmup)
             )
             if should_compile:
-                compiled_fn = _try_compile(func, args)
+                compiled_fn = _try_compile(func, args, explain=explain)
                 if compiled_fn is not None:
                     compiled_types = tuple(type(a) for a in args)
                     # Eager: immediately use the compiled version for this call too
@@ -91,6 +96,7 @@ def jit(
 
         wrapper._pyjit_warmup = warmup  # type: ignore[attr-defined]
         wrapper._pyjit_eager = eager  # type: ignore[attr-defined]
+        wrapper._pyjit_explain = explain  # type: ignore[attr-defined]
         wrapper._pyjit_compiled = False  # type: ignore[attr-defined]
         wrapper._pyjit_get_compiled = lambda: compiled_fn  # type: ignore[attr-defined]
         return wrapper  # type: ignore[return-value]
@@ -165,12 +171,17 @@ def _prepare_native_args(args: tuple[Any, ...], compiled_types: tuple[type, ...]
     return result
 
 
-def _try_compile(func: Callable[..., Any], args: tuple[Any, ...]) -> Any:
+def _try_compile(func: Callable[..., Any], args: tuple[Any, ...], explain: bool = False) -> Any:
     """Attempt to compile a function to native code."""
     try:
         from pyjit._compiler import compile_function
 
-        result = compile_function(func, args)
+        explain_log: list[str] | None = [] if explain else None
+        result = compile_function(func, args, explain_log=explain_log)
+        if explain_log:
+            print(f"[pyjit] {func.__name__}:")
+            for line in explain_log:
+                print(f"  {line}")
         if result is not None:
             return result
     except Exception:

@@ -84,6 +84,66 @@ class TestNativeModule:
         assert pyjit.__version__ == "0.1.0"
 
 
+class TestExplainMode:
+    """Test @jit(explain=True) diagnostic output."""
+
+    def test_explain_does_not_break_result(self) -> None:
+        @jit(warmup=1, explain=True)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += i
+            return s
+
+        fn(0)
+        assert fn(10) == sum(range(10))
+
+    def test_explain_false_by_default(self) -> None:
+        @jit
+        def fn(n: int) -> int:
+            return n + 1
+
+        assert fn(5) == 6
+
+
+class TestCacheAPI:
+    """Test pyjit.cache_stats / pyjit.clear_cache."""
+
+    def test_cache_stats_returns_dict(self) -> None:
+        import pyjit
+
+        stats = pyjit.cache_stats()
+        assert "entries" in stats
+        assert "size_bytes" in stats
+        assert "path" in stats
+
+    def test_clear_cache_returns_int(self) -> None:
+        import pyjit
+
+        count = pyjit.clear_cache()
+        assert isinstance(count, int)
+        assert count >= 0
+
+    def test_cache_populated_after_compile(self) -> None:
+        import pyjit
+        from pyjit._cache import clear_cache
+
+        clear_cache()
+
+        @jit(warmup=1)
+        def fn(n: int) -> int:
+            s = 0
+            for i in range(n):
+                s += i
+            return s
+
+        fn(5)  # triggers compilation and caching
+        fn(5)
+
+        stats = pyjit.cache_stats()
+        assert stats["entries"] >= 1
+
+
 class TestEdgeCases:
     """Edge cases for the decorator."""
 

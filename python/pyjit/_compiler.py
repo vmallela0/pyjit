@@ -15,6 +15,25 @@ from pyjit._pyjit import (
     compile_loop_ir,
 )
 
+# ---------------------------------------------------------------------------
+# Explain mode — thread-local log for @jit(explain=True) diagnostics
+# ---------------------------------------------------------------------------
+
+_explain_log: list[str] | None = None
+
+
+def _log(msg: str) -> None:
+    """Append a message to the explain log if explain mode is active."""
+    if _explain_log is not None:
+        _explain_log.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# Inline slot base: inner-function locals are remapped above this threshold.
+# Must be above the 100+ temp-slot range used by _make_binop.
+# ---------------------------------------------------------------------------
+_INLINE_SLOT_BASE = 500
+
 # BINARY_OP sub-opcode to IR op name mapping
 _BINOP_MAP: dict[int, str] = {
     0: "Add",  # NB_ADD
@@ -43,14 +62,16 @@ TYPE_F64 = 1
 def compile_function(
     func: Callable[..., Any],
     args: tuple[Any, ...],
+    explain_log: list[str] | None = None,
 ) -> CompiledFunction | None:
     """Compile a Python function to native code.
 
     Supports int and float arguments for loop functions.
     Returns None if the function can't be compiled.
     """
+    global _explain_log
+    _explain_log = explain_log
 
-    # Check all args are numeric, lists, or numpy arrays
     def _is_supported(a: Any) -> bool:
         if isinstance(a, (int, float, list)):
             return True
@@ -62,23 +83,51 @@ def compile_function(
             return False
 
     if not all(_is_supported(a) for a in args):
+        _log("bail: unsupported argument type(s)")
         return None
 
-    loop_result = _try_compile_loop(func, args)
-    if loop_result is not None:
-        return loop_result
+    arg_types = [type(a).__name__ for a in args]
 
-    while_result = _try_compile_while_loop(func, args)
-    if while_result is not None:
-        return while_result
+    # ---- Disk cache check ----
+    from pyjit._cache import load_compile_args, save_compile_args
 
+    cached = load_compile_args(func.__code__, arg_types)
+    if cached is not None:
+        _log(f"cache hit for {func.__name__}({', '.join(arg_types)})")
+        try:
+            return compile_loop_ir(**cached)
+        except Exception as e:
+            _log(f"cache hit but recompile failed: {e}")
+            # Fall through to normal compilation
+
+    _log(f"cache miss — analyzing {func.__name__}({', '.join(arg_types)})")
+
+    loop_args = _build_loop_compile_args(func, args)
+    if loop_args is not None:
+        _log("detected for-loop pattern")
+        save_compile_args(func.__code__, arg_types, loop_args)
+        try:
+            return compile_loop_ir(**loop_args)
+        except Exception as e:
+            _log(f"for-loop compile_loop_ir failed: {e}")
+
+    while_args = _build_while_loop_compile_args(func, args)
+    if while_args is not None:
+        _log("detected while-loop pattern")
+        save_compile_args(func.__code__, arg_types, while_args)
+        try:
+            return compile_loop_ir(**while_args)
+        except Exception as e:
+            _log(f"while-loop compile_loop_ir failed: {e}")
+
+    _log("bail: no compilable loop pattern found")
     return None
 
 
-def _try_compile_loop(
+def _build_loop_compile_args(
     func: Callable[..., Any],
     args: tuple[Any, ...],
-) -> CompiledFunction | None:
+) -> dict[str, Any] | None:
     """Try to detect and compile a range-for loop pattern."""
     code = func.__code__
     instructions = list(dis.get_instructions(code))
@@ -90,10 +139,12 @@ def _try_compile_loop(
             break
 
     if for_iter_idx is None:
+        _log("bail: no FOR_ITER found")
         return None
 
     range_spec = _detect_range_spec(instructions, for_iter_idx, code)
     if range_spec is None:
+        _log("bail: range() pattern not detected")
         return None
 
     body_start = for_iter_idx + 1
@@ -114,9 +165,11 @@ def _try_compile_loop(
             body_end = i
 
     if body_end is None:
+        _log("bail: could not find loop body end")
         return None
 
     if instructions[body_start].opname != "STORE_FAST":
+        _log("bail: loop body doesn't start with STORE_FAST")
         return None
     iter_var_slot = instructions[body_start].arg
     if iter_var_slot is None:
@@ -143,8 +196,10 @@ def _try_compile_loop(
         code,
         iter_var_slot,
         numpy_dtypes,
+        func_globals=func.__globals__,
     )
     if body_ops is None:
+        _log("bail: body op extraction failed")
         return None
 
     # Prepend: store the loop counter into the iter var's local slot.
@@ -154,6 +209,7 @@ def _try_compile_loop(
 
     return_local = _find_return_local(instructions)
     if return_local is None:
+        _log("bail: return local not found")
         return None
 
     init_locals_int, init_locals_float, float_slots = _find_init_locals(
@@ -247,35 +303,33 @@ def _try_compile_loop(
         init_locals_int.append((limit_slot, stop_spec[1]))
         limit_param = limit_slot
     else:
+        _log(f"bail: unsupported range stop spec: {stop_spec}")
         return None
 
     start_value = start_spec[1] if start_spec[0] == "const" else 0
     step_value = step_spec[1] if step_spec[0] == "const" else 1
 
-    try:
-        return compile_loop_ir(
-            num_params=num_params,
-            limit_param=limit_param,
-            num_locals=num_locals,
-            return_local=return_local,
-            init_locals=init_locals_int,
-            init_float_locals=init_locals_float,
-            body_ops=body_ops,
-            local_types=local_types,
-            param_types=param_types,
-            return_type_id=return_type_id,
-            func_name=func.__name__,
-            start_value=start_value,
-            step_value=step_value,
-        )
-    except Exception:
-        return None
+    return {
+        "num_params": num_params,
+        "limit_param": limit_param,
+        "num_locals": num_locals,
+        "return_local": return_local,
+        "init_locals": init_locals_int,
+        "init_float_locals": init_locals_float,
+        "body_ops": body_ops,
+        "local_types": local_types,
+        "param_types": param_types,
+        "return_type_id": return_type_id,
+        "func_name": func.__name__,
+        "start_value": start_value,
+        "step_value": step_value,
+    }
 
 
-def _try_compile_while_loop(
+def _build_while_loop_compile_args(
     func: Callable[..., Any],
     args: tuple[Any, ...],
-) -> CompiledFunction | None:
+) -> dict[str, Any] | None:
     """Detect `while i < n: body; i += 1` and compile as a range loop.
 
     Handles three patterns:
@@ -324,6 +378,12 @@ def _try_compile_while_loop(
         if limit_slot >= code.co_argcount:
             continue
 
+        # Only support strict-less-than comparisons (< or >).
+        # <=, >=, ==, != require off-by-one adjustments not yet supported.
+        cmp_type = instr.arg >> 5 if sys.version_info >= (3, 13) else instr.arg >> 4
+        if cmp_type not in (0, 4):  # 0 = <, 4 = >
+            continue
+
         loop_head_offset = instructions[load_start_idx].offset
         body_start = i + 2  # after POP_JUMP_IF_FALSE
 
@@ -365,12 +425,15 @@ def _try_compile_while_loop(
             instructions[body_actual_start:body_end],
             code,
             counter_slot,
+            func_globals=func.__globals__,
         )
         if body_ops is None:
+            _log("bail: body op extraction failed (while loop)")
             continue
 
         return_local = _find_return_local(instructions)
         if return_local is None:
+            _log("bail: return local not found (while loop)")
             continue
 
         init_locals_int, init_locals_float, float_slots = _find_init_locals(instructions, i, code)
@@ -390,22 +453,19 @@ def _try_compile_while_loop(
             local_types_list[return_local] if return_local < len(local_types_list) else TYPE_I64
         )
 
-        try:
-            return compile_loop_ir(
-                num_params=num_params,
-                limit_param=limit_slot,
-                num_locals=num_locals,
-                return_local=return_local,
-                init_locals=init_locals_int,
-                init_float_locals=init_locals_float,
-                body_ops=body_ops,
-                local_types=local_types_list,
-                param_types=param_types,
-                return_type_id=return_type_id,
-                func_name=func.__name__,
-            )
-        except Exception:
-            continue
+        return {
+            "num_params": num_params,
+            "limit_param": limit_slot,
+            "num_locals": num_locals,
+            "return_local": return_local,
+            "init_locals": init_locals_int,
+            "init_float_locals": init_locals_float,
+            "body_ops": body_ops,
+            "local_types": local_types_list,
+            "param_types": param_types,
+            "return_type_id": return_type_id,
+            "func_name": func.__name__,
+        }
 
     return None
 
@@ -586,6 +646,7 @@ def _extract_body_ops(
     code: Any,
     iter_var_slot: int,
     numpy_dtypes: dict[int, str] | None = None,
+    func_globals: dict[str, Any] | None = None,
 ) -> list[tuple[str, int, int, int, bool, int]] | None:
     """Extract loop body operations as (kind, dst, src_a, src_b, is_b_imm, imm).
 
@@ -727,12 +788,38 @@ def _extract_body_ops(
             if true_end_idx is None:
                 return None
 
+            # ---- break detection ----
+            # If the true branch is just a JUMP_FORWARD to outside the body,
+            # this is `if cond: break`. Emit BreakIf and skip to false branch.
+            body_offsets = {x.offset for x in instrs}
+            if (
+                true_end_idx is not None
+                and instrs[true_end_idx].opname == "JUMP_FORWARD"
+                and true_start_idx == true_end_idx  # nothing between POP_JUMP and the JUMP_FORWARD
+                and instrs[true_end_idx].argval is not None
+                and instrs[true_end_idx].argval not in body_offsets
+            ):
+                # Simple `if cond: break` — emit BreakIf op
+                # POP_JUMP_IF_FALSE: break when cond is TRUE  → invert=0
+                # POP_JUMP_IF_TRUE:  break when cond is FALSE → invert=1
+                invert = 1 if name == "POP_JUMP_IF_TRUE" else 0
+                ops.append(("BreakIf", cmp_slot, invert, 0, False, 0))
+                _log(f"  detected break: BreakIf(cmp={cmp_slot}, invert={invert})")
+                # Continue from where the false branch starts (jump_target in instrs)
+                new_i = len(instrs)
+                for k, x in enumerate(instrs):
+                    if x.offset == jump_target:
+                        new_i = k
+                        break
+                i = new_i
+                continue
+
             # Extract true branch instructions
             true_instrs = instrs[true_start_idx:true_end_idx]
             true_instrs = [x for x in true_instrs if x.opname not in ("NOT_TAKEN", "NOP")]
 
             # Extract true branch body ops recursively
-            true_ops = _extract_body_ops(true_instrs, code, iter_var_slot)
+            true_ops = _extract_body_ops(true_instrs, code, iter_var_slot, func_globals=func_globals)
 
             # If POP_JUMP_IF_TRUE, the "true" branch is actually the skip (false path)
             # and the jump target is the real body. Swap them.
@@ -758,7 +845,7 @@ def _extract_body_ops(
                     if real_body_end is None:
                         real_body_end = len(instrs)
                     real_instrs = instrs[real_body_start:real_body_end]
-                    true_ops = _extract_body_ops(real_instrs, code, iter_var_slot)
+                    true_ops = _extract_body_ops(real_instrs, code, iter_var_slot, func_globals=func_globals)
                     i_skip = max(real_body_end, len(instrs))
                     false_start_idx = None  # no else for POP_JUMP_IF_TRUE
                 else:
@@ -783,7 +870,7 @@ def _extract_body_ops(
                 if false_end_idx is None:
                     false_end_idx = len(instrs)  # extends to end of body
                 false_instrs = instrs[false_start_idx:false_end_idx]
-                false_ops = _extract_body_ops(false_instrs, code, iter_var_slot)
+                false_ops = _extract_body_ops(false_instrs, code, iter_var_slot, func_globals=func_globals)
                 i_skip = max(false_end_idx, len(instrs))
 
             # Emit: CondStart + true_ops + [CondElse + false_ops] + CondEnd
@@ -812,8 +899,12 @@ def _extract_body_ops(
             val = stack.pop()
             if isinstance(val, int):
                 if ops and ops[-1][1] >= 100:
+                    # Rename the last temp-slot op to write directly to arg
                     last = ops[-1]
                     ops[-1] = (last[0], arg, last[2], last[3], last[4], last[5])
+                elif val != arg:
+                    # Local-to-local copy (e.g. `mx = v`): emit "Add src, 0"
+                    ops.append(("Add", arg, val, 0, True, 0))
             elif isinstance(val, tuple) and len(val) == 2 and val[0] == "imm":
                 # Store a constant into a local: emit a LoadConst op
                 imm_val = val[1]
@@ -935,39 +1026,78 @@ def _extract_body_ops(
                             stack.pop()  # pop callable
                         if stack and stack[-1] is None:
                             stack.pop()  # pop NULL below callable
-                        temp_slot = 100 + len(ops)
-                        src_a = _resolve_val(arg1, ops)
-                        src_b = _resolve_val(arg2, ops)
                         op_name = "Min" if builtin_name == "min" else "Max"
-                        ops.append((op_name, temp_slot, src_a, src_b, False, 0))
-                        stack.append(temp_slot)
+                        result = _make_binop(op_name, arg1, arg2, ops)
+                        if result is None:
+                            return None
+                        stack.append(result)
                         builtin_handled = True
 
             if not builtin_handled:
-                # Fall back: handle float()/int() type conversions.
-                if n_call_args == 1 and stack:
-                    call_arg = stack.pop()  # pop arg
-                    popped_callable = stack.pop() if stack else None  # pop callable
-                    if stack and stack[-1] is None:
-                        stack.pop()  # pop NULL placeholder if present
-                    callable_name = (
-                        popped_callable[1]
-                        if isinstance(popped_callable, tuple) and len(popped_callable) == 2
+                # Try user-function inlining (for global functions with __code__)
+                inlined = False
+                if n_call_args >= 1 and func_globals is not None:
+                    inline_callable_pos = -(n_call_args + 1)
+                    inline_callable = (
+                        stack[inline_callable_pos]
+                        if abs(inline_callable_pos) <= len(stack)
                         else None
                     )
-                    if callable_name == "float":
-                        # Emit explicit ToF64 conversion so type propagation marks the result f64.
-                        temp_slot = 100 + len(ops)
-                        src = _resolve_val(call_arg, ops)
-                        ops.append(("ToF64", temp_slot, src, 0, False, 0))
-                        stack.append(temp_slot)
-                    elif callable_name in ("int", "range"):
-                        # Passthrough — keep value as-is
-                        stack.append(call_arg)
+                    if inline_callable is None and abs(inline_callable_pos) < len(stack):
+                        inline_callable = stack[inline_callable_pos - 1]
+
+                    if isinstance(inline_callable, tuple) and inline_callable[0] == "global":
+                        gname_idx = inline_callable[1] >> 1
+                        gnames = code.co_names
+                        if gname_idx < len(gnames):
+                            fn_obj = func_globals.get(gnames[gname_idx])
+                            if (
+                                fn_obj is not None
+                                and callable(fn_obj)
+                                and hasattr(fn_obj, "__code__")
+                                and not isinstance(fn_obj, type)
+                            ):
+                                # Pop args, then callable and any NULL placeholder
+                                inline_args: list[Any] = []
+                                for _ in range(n_call_args):
+                                    if stack:
+                                        inline_args.insert(0, stack.pop())
+                                while stack and stack[-1] in (None, inline_callable):
+                                    stack.pop()
+                                inline_base = _INLINE_SLOT_BASE + (len(ops) // 10 + 1) * 10
+                                inline_result = _try_inline_call(
+                                    fn_obj.__code__, inline_args, inline_base, ops, code
+                                )
+                                if inline_result is not None:
+                                    extra_ops, ret_val = inline_result
+                                    ops.extend(extra_ops)
+                                    stack.append(ret_val)
+                                    inlined = True
+                                    _log(f"  inlined {gnames[gname_idx]}")
+
+                if not inlined:
+                    # Fall back: handle float()/int() type conversions.
+                    if n_call_args == 1 and stack:
+                        call_arg = stack.pop()  # pop arg
+                        popped_callable = stack.pop() if stack else None  # pop callable
+                        if stack and stack[-1] is None:
+                            stack.pop()  # pop NULL placeholder if present
+                        callable_name = (
+                            popped_callable[1]
+                            if isinstance(popped_callable, tuple) and len(popped_callable) == 2
+                            else None
+                        )
+                        if callable_name == "float":
+                            temp_slot = 100 + len(ops)
+                            src = _resolve_val(call_arg, ops)
+                            ops.append(("ToF64", temp_slot, src, 0, False, 0))
+                            stack.append(temp_slot)
+                        elif callable_name in ("int", "range"):
+                            stack.append(call_arg)
+                        else:
+                            return None  # unknown callable — bail out
                     else:
-                        return None  # unknown callable — bail out
-                else:
-                    return None
+                        return None
 
         elif name == "LOAD_GLOBAL":
             # Resolve the global name to check for known builtins
@@ -1081,7 +1211,7 @@ def _extract_body_ops(
 
             # Recursively extract inner body ops
             inner_body_instrs = instrs[inner_body_start:inner_body_end]
-            inner_ops = _extract_body_ops(inner_body_instrs, code, inner_iter_slot)
+            inner_ops = _extract_body_ops(inner_body_instrs, code, inner_iter_slot, func_globals=func_globals)
             if inner_ops is None:
                 return None
 
@@ -1126,6 +1256,143 @@ def _extract_body_ops(
         i += 1
 
     return ops if ops else None
+
+
+def _try_inline_call(
+    inner_code: Any,
+    arg_vals: list[Any],
+    base_slot: int,
+    outer_ops: list[tuple[str, int, int, int, bool, int]],
+    outer_code: Any,
+) -> tuple[list[tuple[str, int, int, int, bool, int]], Any] | None:
+    """Try to inline a simple pure function into the loop body.
+
+    Args:
+        inner_code: __code__ of the function to inline.
+        arg_vals:   actual argument values (slot ints / "counter" / ("imm", v)).
+        base_slot:  base slot number for remapping inner locals (avoids collision).
+        outer_ops:  accumulated outer ops (used for temp slot counting).
+        outer_code: outer code object (unused, kept for future use).
+
+    Returns (new_ops, return_val) where return_val is a slot int or tuple,
+    or None if inlining is not safe/possible.
+    """
+    import struct as _struct
+
+    num_params = inner_code.co_argcount
+    if num_params != len(arg_vals):
+        return None
+
+    inner_instrs = list(dis.get_instructions(inner_code))
+
+    # Reject functions with loops, calls, or other complex ops
+    for instr in inner_instrs:
+        if instr.opname in (
+            "FOR_ITER",
+            "GET_ITER",
+            "CALL",
+            "IMPORT_NAME",
+            "IMPORT_FROM",
+            "RAISE_VARARGS",
+            "YIELD_VALUE",
+            "LOAD_GLOBAL",
+            "LOAD_ATTR",
+        ):
+            return None
+
+    stack: list[Any] = []
+    ops: list[tuple[str, int, int, int, bool, int]] = []
+    # Temp slots start at base_slot + 100 so they never collide with param remaps
+    temp_base = base_slot + 100
+
+    for instr in inner_instrs:
+        name = instr.opname
+        arg = instr.arg if instr.arg is not None else 0
+
+        if name in ("RESUME", "NOT_TAKEN", "NOP"):
+            continue
+
+        elif name in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
+            if arg < num_params:
+                stack.append(arg_vals[arg])
+            else:
+                stack.append(base_slot + arg)
+
+        elif name in ("LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"):
+            idx_a = (arg >> 4) & 0xF
+            idx_b = arg & 0xF
+            stack.append(arg_vals[idx_a] if idx_a < num_params else base_slot + idx_a)
+            stack.append(arg_vals[idx_b] if idx_b < num_params else base_slot + idx_b)
+
+        elif name == "LOAD_SMALL_INT":
+            stack.append(("imm", arg))
+
+        elif name == "LOAD_CONST":
+            consts = inner_code.co_consts
+            if arg < len(consts) and isinstance(consts[arg], (int, float)):
+                stack.append(("imm", consts[arg]))
+            else:
+                return None
+
+        elif name == "BINARY_OP":
+            if len(stack) < 2:
+                return None
+            b_val = stack.pop()
+            a_val = stack.pop()
+            op_name = _BINOP_MAP.get(arg)
+            if op_name is None:
+                return None
+            temp_slot = temp_base + len(ops)
+            src_a = _resolve_val(a_val, ops)
+            if isinstance(b_val, tuple) and len(b_val) == 2 and b_val[0] == "imm":
+                imm_val = b_val[1]
+                if isinstance(imm_val, float):
+                    imm_bits = _struct.unpack("<q", _struct.pack("<d", imm_val))[0]
+                    ops.append((op_name, temp_slot, src_a, 0, True, imm_bits))
+                else:
+                    ops.append((op_name, temp_slot, src_a, 0, True, int(imm_val)))
+            elif b_val == "counter":
+                ops.append((op_name, temp_slot, src_a, COUNTER_SENTINEL, False, 0))
+            elif isinstance(b_val, int):
+                ops.append((op_name, temp_slot, src_a, b_val, False, 0))
+            else:
+                return None
+            stack.append(temp_slot)
+
+        elif name == "UNARY_NEGATIVE":
+            if not stack:
+                return None
+            val = stack.pop()
+            temp_slot = temp_base + len(ops)
+            src = _resolve_val(val, ops)
+            ops.append(("Neg", temp_slot, src, 0, False, 0))
+            stack.append(temp_slot)
+
+        elif name in ("STORE_FAST", "STORE_FAST_MAYBE_NULL"):
+            if not stack:
+                return None
+            val = stack.pop()
+            rslot = base_slot + arg  # always remap inner locals
+            if isinstance(val, int) and ops:
+                last = ops[-1]
+                ops[-1] = (last[0], rslot, last[2], last[3], last[4], last[5])
+            elif isinstance(val, tuple) and len(val) == 2 and val[0] == "imm":
+                imm_val = val[1]
+                if isinstance(imm_val, float):
+                    imm_bits = _struct.unpack("<q", _struct.pack("<d", imm_val))[0]
+                    ops.append(("LoadConst", rslot, 0, 0, True, imm_bits))
+                else:
+                    ops.append(("LoadConst", rslot, 0, 0, True, int(imm_val)))
+
+        elif name == "RETURN_VALUE":
+            if not stack:
+                return None
+            return ops, stack[-1]
+
+        else:
+            return None  # unsupported — give up
+
+    return None  # no RETURN_VALUE encountered
 
 
 def _extract_conditional_branches(
