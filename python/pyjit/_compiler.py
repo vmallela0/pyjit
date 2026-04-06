@@ -380,7 +380,8 @@ def _build_while_loop_compile_args(
 
         # Only support strict-less-than comparisons (< or >).
         # <=, >=, ==, != require off-by-one adjustments not yet supported.
-        cmp_type = instr.arg >> 5 if sys.version_info >= (3, 13) else instr.arg >> 4
+        raw_arg = instr.arg if instr.arg is not None else 0
+        cmp_type = raw_arg >> 5 if sys.version_info >= (3, 13) else raw_arg >> 4
         if cmp_type not in (0, 4):  # 0 = <, 4 = >
             continue
 
