@@ -50,6 +50,16 @@ _BINOP_MAP: dict[int, str] = {
     19: "Mod",  # NB_INPLACE_REMAINDER
     8: "Pow",  # NB_POWER
     21: "Pow",  # NB_INPLACE_POWER
+    1: "BitAnd",  # NB_AND
+    7: "BitOr",  # NB_OR
+    12: "BitXor",  # NB_XOR
+    3: "LShift",  # NB_LSHIFT
+    9: "RShift",  # NB_RSHIFT
+    14: "BitAnd",  # NB_INPLACE_AND
+    20: "BitOr",  # NB_INPLACE_OR
+    25: "BitXor",  # NB_INPLACE_XOR
+    16: "LShift",  # NB_INPLACE_LSHIFT
+    22: "RShift",  # NB_INPLACE_RSHIFT
 }
 
 COUNTER_SENTINEL = 2**64 - 1  # usize::MAX — means "use loop counter"
@@ -925,7 +935,8 @@ def _extract_body_ops(
                 else:
                     ops.append(("LoadConst", arg, 0, 0, True, int(imm_val)))
             elif val == "counter":
-                pass
+                # Copy loop counter into a named local: v = i → v = counter + 0
+                ops.append(("Add", arg, COUNTER_SENTINEL, 0, True, 0))
 
         elif name == "UNARY_NEGATIVE":
             if not stack:

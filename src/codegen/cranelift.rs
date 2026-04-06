@@ -1004,6 +1004,11 @@ fn emit_body_ops(
                         "Add" => b.ins().iadd(a, bv),
                         "Sub" => b.ins().isub(a, bv),
                         "Mul" => b.ins().imul(a, bv),
+                        "BitAnd" => b.ins().band(a, bv),
+                        "BitOr"  => b.ins().bor(a, bv),
+                        "BitXor" => b.ins().bxor(a, bv),
+                        "LShift" => b.ins().ishl(a, bv),
+                        "RShift" => b.ins().sshr(a, bv),
                         "FloorDiv" => {
                             // Guard: replace 0 divisor with 1 to prevent SIGFPE
                             let zero = b.ins().iconst(types::I64, 0);

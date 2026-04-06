@@ -15,7 +15,7 @@ import pickle
 from pathlib import Path
 from typing import Any
 
-_CACHE_VERSION = "0.2.0"
+_CACHE_VERSION = "0.3.0"
 _CACHE_DIR = Path.home() / ".cache" / "pyjit"
 
 
