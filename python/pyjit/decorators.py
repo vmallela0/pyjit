@@ -14,13 +14,11 @@ _I64_MAX = 2**63 - 1
 
 
 @overload
-def jit(fn: F) -> F:
-    ...
+def jit(fn: F) -> F: ...
 
 
 @overload
-def jit(*, warmup: int = 10, eager: bool = False) -> Callable[[F], F]:
-    ...
+def jit(*, warmup: int = 10, eager: bool = False) -> Callable[[F], F]: ...
 
 
 def jit(
