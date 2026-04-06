@@ -838,33 +838,72 @@ def _extract_body_ops(
 
             # If POP_JUMP_IF_TRUE, the "true" branch is actually the skip (false path)
             # and the jump target is the real body. Swap them.
+            # Python 3.14 uses POP_JUMP_IF_TRUE only when the body is at the END of the
+            # loop (no code after). The body always extends to len(instrs).
+            # Patterns handled:
+            #   and: each FALSE path is JUMP_BACKWARD (continue); TRUE proceeds to next check
+            #   or:  each TRUE path jumps to the same body; FALSE proceeds to next check
             if name == "POP_JUMP_IF_TRUE":
-                # true_instrs is the "skip" path (between fall-through and jump target)
-                # The real body is at jump_target onwards until JUMP_BACKWARD
                 real_body_start = None
-                real_body_end = None
                 for j in range(i + 1, len(instrs)):
                     if instrs[j].offset == jump_target:
                         real_body_start = j
                         break
-                if real_body_start is not None:
-                    for j in range(real_body_start, len(instrs)):
-                        if instrs[j].opname in (
-                            "JUMP_BACKWARD",
-                            "JUMP_BACKWARD_NO_INTERRUPT",
-                        ):
-                            real_body_end = j
-                            break
 
                 if real_body_start is not None:
-                    if real_body_end is None:
-                        real_body_end = len(instrs)
-                    real_instrs = instrs[real_body_start:real_body_end]
-                    true_ops = _extract_body_ops(
+                    # The body always extends to the end of instrs (POP_JUMP_IF_TRUE is only
+                    # used when the if-body is the last thing in the loop body).
+                    real_instrs = instrs[real_body_start:]
+                    body_ops_pjit = _extract_body_ops(
                         real_instrs, code, iter_var_slot, func_globals=func_globals
                     )
-                    i_skip = max(real_body_end, len(instrs))
-                    false_start_idx = None  # no else for POP_JUMP_IF_TRUE
+
+                    # --- OR detection ---
+                    # If the fall-through path (true_instrs) contains another
+                    # POP_JUMP_IF_TRUE pointing to the same jump_target, this is an `or`.
+                    # Extract cmp2 and combine with BoolOr.
+                    skip_instrs = [
+                        x for x in instrs[true_start_idx:true_end_idx]
+                        if x.opname not in ("NOT_TAKEN", "NOP")
+                    ]
+                    or_cmp_slot: int | None = None
+                    for k, sk in enumerate(skip_instrs):
+                        if sk.opname == "POP_JUMP_IF_TRUE" and sk.argval == jump_target:
+                            # Found a second condition pointing to the same body.
+                            cmp2_instrs = skip_instrs[:k]
+                            cmp2_ops_raw = _extract_body_ops(
+                                cmp2_instrs, code, iter_var_slot, func_globals=func_globals
+                            )
+                            if cmp2_ops_raw and cmp2_ops_raw[-1][0].startswith("Cmp"):
+                                # Remap temp slots (>= 100, != COUNTER_SENTINEL) to avoid
+                                # collision with slots already in the outer ops list.
+                                _offset = len(ops)
+                                cmp2_ops = [
+                                    (
+                                        kd,
+                                        d + _offset if 100 <= d < COUNTER_SENTINEL else d,
+                                        a + _offset if 100 <= a < COUNTER_SENTINEL else a,
+                                        b + _offset if 100 <= b < COUNTER_SENTINEL else b,
+                                        im,
+                                        iv,
+                                    )
+                                    for kd, d, a, b, im, iv in cmp2_ops_raw
+                                ]
+                                or_cmp_slot = cmp2_ops[-1][1]
+                                ops.extend(cmp2_ops)
+                            break
+
+                    if or_cmp_slot is not None:
+                        combined_slot = 100 + len(ops)
+                        ops.append(("BoolOr", combined_slot, cmp_slot, or_cmp_slot, False, 0))
+                        true_ops = body_ops_pjit
+                        # Replace cmp_slot so CondStart uses the combined condition
+                        cmp_slot = combined_slot
+                    else:
+                        true_ops = body_ops_pjit
+
+                    i_skip = len(instrs)
+                    false_start_idx = None
                 else:
                     true_ops = None
                     i_skip = true_end_idx + 1
@@ -937,6 +976,49 @@ def _extract_body_ops(
             elif val == "counter":
                 # Copy loop counter into a named local: v = i → v = counter + 0
                 ops.append(("Add", arg, COUNTER_SENTINEL, 0, True, 0))
+
+        elif name == "STORE_FAST_STORE_FAST":
+            # Python 3.13+: `a, b = expr_a, expr_b`
+            # arg = (slot_tos << 4) | slot_tos1
+            # TOS  → slot_tos;  TOS1 → slot_tos1
+            slot_tos = arg >> 4
+            slot_tos1 = arg & 0xF
+            if len(stack) < 2:
+                return None
+            val_tos = stack.pop()    # TOS  → slot_tos
+            val_tos1 = stack.pop()   # TOS1 → slot_tos1
+
+            # Find the op index for the TOS computation (to rename its destination).
+            tos_op_idx = len(ops) - 1 if (isinstance(val_tos, int) and val_tos >= 100 and ops) else None
+
+            # If val_tos1 is the same slot being written by val_tos, save the old value
+            # BEFORE the rename overwrites it (avoids simultaneous-assignment aliasing).
+            effective_tos1 = val_tos1
+            if (
+                isinstance(val_tos1, int)
+                and val_tos1 < 100
+                and val_tos1 == slot_tos
+                and tos_op_idx is not None
+            ):
+                temp_save = 100 + len(ops)
+                ops.insert(tos_op_idx, ("Add", temp_save, val_tos1, 0, True, 0))
+                tos_op_idx += 1  # shift due to insertion
+                effective_tos1 = temp_save
+
+            # Write val_tos → slot_tos
+            if tos_op_idx is not None:
+                last = ops[tos_op_idx]
+                ops[tos_op_idx] = (last[0], slot_tos, last[2], last[3], last[4], last[5])
+            elif isinstance(val_tos, int) and val_tos < 100 and val_tos != slot_tos:
+                ops.append(("Add", slot_tos, val_tos, 0, True, 0))
+            elif val_tos == "counter":
+                ops.append(("Add", slot_tos, COUNTER_SENTINEL, 0, True, 0))
+
+            # Write effective_tos1 → slot_tos1
+            if isinstance(effective_tos1, int) and effective_tos1 != slot_tos1:
+                ops.append(("Add", slot_tos1, effective_tos1, 0, True, 0))
+            elif effective_tos1 == "counter":
+                ops.append(("Add", slot_tos1, COUNTER_SENTINEL, 0, True, 0))
 
         elif name == "UNARY_NEGATIVE":
             if not stack:
@@ -1619,20 +1701,41 @@ def _find_init_locals(
     float_inits: list[tuple[int, float]] = []
     float_slots: set[int] = set()
 
+    def _extract_const_val(instr: dis.Instruction) -> int | float | None:
+        """Return the integer or float constant loaded by a LOAD_SMALL_INT / LOAD_CONST instr."""
+        if instr.opname == "LOAD_SMALL_INT" and instr.arg is not None:
+            return instr.arg
+        if instr.opname == "LOAD_CONST" and instr.arg is not None:
+            consts = code.co_consts
+            if instr.arg < len(consts):
+                val = consts[instr.arg]
+                if isinstance(val, (int, float)):
+                    return val
+        return None
+
     for i in range(for_iter_idx):
         instr = instructions[i]
         if instr.opname == "STORE_FAST" and i > 0 and instr.arg is not None:
             prev = instructions[i - 1]
-            if prev.opname == "LOAD_SMALL_INT" and prev.arg is not None:
-                int_inits.append((instr.arg, prev.arg))
-            elif prev.opname == "LOAD_CONST" and prev.arg is not None:
-                consts = code.co_consts
-                if prev.arg < len(consts):
-                    val = consts[prev.arg]
+            val = _extract_const_val(prev)
+            if val is not None:
+                if isinstance(val, float):
+                    float_inits.append((instr.arg, val))
+                    float_slots.add(instr.arg)
+                else:
+                    int_inits.append((instr.arg, int(val)))
+        elif instr.opname == "STORE_FAST_STORE_FAST" and i >= 2 and instr.arg is not None:
+            slot_tos = instr.arg >> 4
+            slot_tos1 = instr.arg & 0xF
+            # TOS → slot_tos, TOS1 → slot_tos1
+            val_tos = _extract_const_val(instructions[i - 1])
+            val_tos1 = _extract_const_val(instructions[i - 2])
+            for slot, val in ((slot_tos, val_tos), (slot_tos1, val_tos1)):
+                if val is not None:
                     if isinstance(val, float):
-                        float_inits.append((instr.arg, val))
-                        float_slots.add(instr.arg)
-                    elif isinstance(val, int):
-                        int_inits.append((instr.arg, val))
+                        float_inits.append((slot, val))
+                        float_slots.add(slot)
+                    else:
+                        int_inits.append((slot, int(val)))
 
     return int_inits, float_inits, float_slots

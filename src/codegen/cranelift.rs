@@ -662,6 +662,18 @@ fn emit_body_ops(
             continue;
         }
 
+        if kind == "BoolOr" {
+            // Logical OR of two comparison results (for `if c1 or c2:` patterns)
+            let v1 = cmp_results.get(&src_a).copied()
+                .unwrap_or_else(|| if src_a < locals.len() { locals[src_a] } else { counter });
+            let v2 = cmp_results.get(&src_b).copied()
+                .unwrap_or_else(|| if src_b < locals.len() { locals[src_b] } else { counter });
+            let combined = b.ins().bor(v1, v2);
+            cmp_results.insert(dst, combined);
+            i += 1;
+            continue;
+        }
+
         if kind == "LoadConst" {
             // Store a constant into a local slot
             if dst < locals.len() {
