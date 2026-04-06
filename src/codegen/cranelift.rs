@@ -326,6 +326,7 @@ pub fn compile_loop(
     return_type_id: u8,
     start_value: i64,
     step_value: i64,
+    start_param: usize,
 ) -> Result<CompiledCode, String> {
     let mut flag_builder = settings::builder();
     flag_builder.set("opt_level", "speed").map_err(|e| e.to_string())?;
@@ -420,7 +421,11 @@ pub fn compile_loop(
     // Get the loop limit from the appropriate local (may be a param or a constant-init'd local)
     let limit = init_vals[limit_param];
 
-    let counter_init = b.ins().iconst(types::I64, start_value);
+    let counter_init = if start_param != usize::MAX && start_param < init_vals.len() {
+        init_vals[start_param]
+    } else {
+        b.ins().iconst(types::I64, start_value)
+    };
     let mut args: Vec<BlockArg> = vec![BlockArg::Value(counter_init)];
     args.extend(init_vals.iter().map(|&v| BlockArg::Value(v)));
     b.ins().jump(block_header, &args);

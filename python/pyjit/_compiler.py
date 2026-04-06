@@ -307,6 +307,7 @@ def _build_loop_compile_args(
         return None
 
     start_value = start_spec[1] if start_spec[0] == "const" else 0
+    start_param = start_spec[1] if start_spec[0] == "param" else 2**64 - 1  # usize::MAX = not set
     step_value = step_spec[1] if step_spec[0] == "const" else 1
 
     return {
@@ -322,6 +323,7 @@ def _build_loop_compile_args(
         "return_type_id": return_type_id,
         "func_name": func.__name__,
         "start_value": start_value,
+        "start_param": start_param,
         "step_value": step_value,
     }
 
