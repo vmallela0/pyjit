@@ -276,54 +276,84 @@ def _try_compile_while_loop(
     func: Callable[..., Any],
     args: tuple[Any, ...],
 ) -> CompiledFunction | None:
-    """Detect `while i < n: body; i += 1` and compile as a range loop."""
+    """Detect `while i < n: body; i += 1` and compile as a range loop.
+
+    Handles three patterns:
+    - Python 3.14: single check at top, JUMP_BACKWARD → condition head
+    - Python 3.13: LOAD_FAST_LOAD_FAST fused, double-check, JUMP_BACKWARD → body
+    - Python 3.12: two separate LOAD_FAST, double-check, JUMP_BACKWARD → body
+    """
     code = func.__code__
     instructions = list(dis.get_instructions(code))
 
-    # Look for pattern: COMPARE_OP + POP_JUMP_IF_FALSE + ... + JUMP_BACKWARD
-    # where the JUMP_BACKWARD target is the COMPARE_OP
     for i, instr in enumerate(instructions):
         if instr.opname != "COMPARE_OP":
             continue
         if i + 1 >= len(instructions):
             continue
-        next_instr = instructions[i + 1]
-        if next_instr.opname != "POP_JUMP_IF_FALSE":
+        if instructions[i + 1].opname != "POP_JUMP_IF_FALSE":
             continue
 
-        # Found a while loop candidate. Check for JUMP_BACKWARD pointing back
-        # to the compare or its preceding load instruction
-        loop_head_offset = instructions[i - 1].offset if i > 0 else instr.offset
+        # Detect the load pattern before COMPARE_OP
+        counter_slot: int | None = None
+        limit_slot: int | None = None
+        load_start_idx = i  # index of the first load instruction
+
+        if i >= 1:
+            prev = instructions[i - 1]
+            if prev.opname in ("LOAD_FAST_BORROW_LOAD_FAST_BORROW", "LOAD_FAST_LOAD_FAST"):
+                # Python 3.13/3.14: fused two-register load
+                idx_a = (prev.arg >> 4) & 0xF if prev.arg is not None else 0
+                idx_b = prev.arg & 0xF if prev.arg is not None else 0
+                counter_slot = idx_a
+                limit_slot = idx_b
+                load_start_idx = i - 1
+            elif (
+                i >= 2
+                and prev.opname in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK")
+                and instructions[i - 2].opname
+                in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK")
+            ):
+                # Python 3.12: two separate loads
+                counter_slot = instructions[i - 2].arg if instructions[i - 2].arg is not None else 0
+                limit_slot = prev.arg if prev.arg is not None else 0
+                load_start_idx = i - 2
+
+        if counter_slot is None or limit_slot is None:
+            continue
+        if limit_slot >= code.co_argcount:
+            continue
+
+        loop_head_offset = instructions[load_start_idx].offset
         body_start = i + 2  # after POP_JUMP_IF_FALSE
-        body_end = None
+
+        # Find body_end by locating the (last) JUMP_BACKWARD
+        body_end: int | None = None
         for j in range(body_start, len(instructions)):
-            if instructions[j].opname in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
-                target = instructions[j].argval
-                if target is not None and loop_head_offset <= target <= instr.offset:
-                    body_end = j
+            jop = instructions[j].opname
+            if jop not in ("JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT"):
+                continue
+            target = instructions[j].argval
+            if target is None:
+                continue
+
+            if loop_head_offset <= target <= instr.offset:
+                # Python 3.14: single-check — JUMP_BACKWARD targets the condition head
+                body_end = j
+                break
+
+            if target >= instructions[body_start].offset:
+                # Python 3.12/3.13: double-check — JUMP_BACKWARD targets body start.
+                # Strip the trailing recheck (LOAD*, COMPARE_OP, POP_JUMP_IF_FALSE).
+                stripped = _strip_while_recheck(instructions, j, counter_slot, limit_slot)
+                if stripped is not None:
+                    body_end = stripped
                     break
 
         if body_end is None:
             continue
 
-        # Detect: the comparison is `local_i < local_n` (a param)
-        # Look at what's loaded before COMPARE_OP
-        if i < 1:
-            continue
-        prev = instructions[i - 1]
-        if prev.opname == "LOAD_FAST_BORROW_LOAD_FAST_BORROW":
-            idx_a = (prev.arg >> 4) & 0xF if prev.arg is not None else 0
-            idx_b = prev.arg & 0xF if prev.arg is not None else 0
-            counter_slot = idx_a
-            limit_slot = idx_b
-        else:
-            continue
-
-        # limit_slot should be a param
-        if limit_slot >= code.co_argcount:
-            continue
-
-        # Skip NOT_TAKEN after POP_JUMP_IF_FALSE
+        # Skip NOT_TAKEN/NOP at body start
         body_actual_start = body_start
         while body_actual_start < body_end and instructions[body_actual_start].opname in (
             "NOT_TAKEN",
@@ -331,37 +361,20 @@ def _try_compile_while_loop(
         ):
             body_actual_start += 1
 
-        # Extract body ops (reuse for-loop body extractor)
         body_ops = _extract_body_ops(
             instructions[body_actual_start:body_end],
             code,
-            counter_slot,  # treat the while counter as the "iter var"
+            counter_slot,
         )
         if body_ops is None:
             continue
 
-        # Find return local
         return_local = _find_return_local(instructions)
         if return_local is None:
             continue
 
-        # Find init locals
         init_locals_int, init_locals_float, float_slots = _find_init_locals(instructions, i, code)
 
-        # The while loop counter is managed by body ops (i += 1 is in the body).
-        # We can use the same compile_loop infrastructure with the counter as a regular local.
-        # BUT: we need to tell compile_loop that the "loop limit" param controls the loop.
-        # The difference from for-range: the counter lives in a local, not the hardware counter.
-        # We can reuse compile_loop by having the body ops include the i += 1, and
-        # the counter_slot IS the loop variable tracked by compile_loop's counter.
-
-        # Actually, the simplest: detect that body contains `i += 1` and strip it,
-        # then compile as range(limit_slot) loop.
-        # Check if body_ops has an Add to counter_slot with imm 1
-        # (This would be generated as ("Add", counter_slot, counter_slot, 0, True, 1)
-        # but since counter_slot maps to COUNTER_SENTINEL, it'd be different)
-
-        # For now, use compile_loop directly — the while counter IS the range counter
         num_params = code.co_argcount
         param_types = [TYPE_I64] * num_params
         base_locals = code.co_nlocals
@@ -393,6 +406,64 @@ def _try_compile_while_loop(
             )
         except Exception:
             continue
+
+    return None
+
+
+def _strip_while_recheck(
+    instructions: list[dis.Instruction],
+    jump_backward_idx: int,
+    counter_slot: int,
+    limit_slot: int,
+) -> int | None:
+    """Return the index where a while-loop recheck starts, or None.
+
+    In Python 3.12/3.13, while loops end with a duplicate condition check:
+      [LOAD*, COMPARE_OP, POP_JUMP_IF_FALSE, JUMP_BACKWARD]
+    We detect this pattern and return the index of LOAD* so the caller
+    can exclude the recheck from body_ops.
+    """
+    j = jump_backward_idx
+    if j < 2:
+        return None
+    if instructions[j - 1].opname != "POP_JUMP_IF_FALSE":
+        return None
+    if instructions[j - 2].opname != "COMPARE_OP":
+        return None
+
+    # Check for fused load at j-3
+    if j >= 3 and instructions[j - 3].opname in (
+        "LOAD_FAST_BORROW_LOAD_FAST_BORROW",
+        "LOAD_FAST_LOAD_FAST",
+    ):
+        rc = instructions[j - 3]
+        a = (rc.arg >> 4) & 0xF if rc.arg is not None else 0
+        b = rc.arg & 0xF if rc.arg is not None else 0
+        if a == counter_slot and b == limit_slot:
+            return j - 3
+
+    # Check for two separate loads at j-4, j-3
+    if (
+        j >= 4
+        and instructions[j - 3].opname
+        in (
+            "LOAD_FAST",
+            "LOAD_FAST_BORROW",
+            "LOAD_FAST_CHECK",
+        )
+        and instructions[j - 4].opname
+        in (
+            "LOAD_FAST",
+            "LOAD_FAST_BORROW",
+            "LOAD_FAST_CHECK",
+        )
+    ):
+        arg_a = instructions[j - 4].arg
+        arg_b = instructions[j - 3].arg
+        a = arg_a if arg_a is not None else 0
+        b = arg_b if arg_b is not None else 0
+        if a == counter_slot and b == limit_slot:
+            return j - 4
 
     return None
 
@@ -534,7 +605,8 @@ def _extract_body_ops(
         if name in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
             stack.append("counter" if arg == iter_var_slot else arg)
 
-        elif name == "LOAD_FAST_BORROW_LOAD_FAST_BORROW":
+        elif name in ("LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"):
+            # Python 3.13 uses LOAD_FAST_LOAD_FAST; Python 3.14 uses LOAD_FAST_BORROW_LOAD_FAST_BORROW
             idx_a = (arg >> 4) & 0xF
             idx_b = arg & 0xF
             stack.append("counter" if idx_a == iter_var_slot else idx_a)
@@ -549,6 +621,24 @@ def _extract_body_ops(
                 stack.append(("imm", consts[arg]))
             else:
                 return None
+
+        elif name == "BINARY_SUBSCR":
+            # Python 3.12/3.13: separate opcode for subscript access (3.14 merged into BINARY_OP arg=26)
+            if len(stack) < 2:
+                return None
+            b_val = stack.pop()
+            a_val = stack.pop()
+            container = _resolve_val(a_val, ops)
+            index = _resolve_val(b_val, ops)
+            temp_slot = 100 + len(ops)
+            ndtype = (numpy_dtypes or {}).get(container)
+            if ndtype == "f64":
+                ops.append(("LoadElementF64", temp_slot, container, index, False, 0))
+            elif ndtype == "i64":
+                ops.append(("LoadElementI64", temp_slot, container, index, False, 0))
+            else:
+                ops.append(("LoadElement", temp_slot, container, index, False, 0))
+            stack.append(temp_slot)
 
         elif name == "BINARY_OP":
             if len(stack) < 2:
@@ -584,8 +674,8 @@ def _extract_body_ops(
                 return None
             b_val = stack.pop()
             a_val = stack.pop()
-            # Comparison type encoding changed in Python 3.14 (arg >> 5) vs 3.12/3.13 (arg >> 4)
-            cmp_op = arg >> 5 if sys.version_info >= (3, 14) else arg >> 4
+            # Comparison type encoding changed in Python 3.13+ (arg >> 5) vs 3.12 (arg >> 4)
+            cmp_op = arg >> 5 if sys.version_info >= (3, 13) else arg >> 4
             cmp_names = {0: "CmpLt", 1: "CmpLe", 2: "CmpEq", 3: "CmpNe", 4: "CmpGt", 5: "CmpGe"}
             cmp_name = cmp_names.get(cmp_op)
             if cmp_name is None:
@@ -1158,7 +1248,7 @@ def _extract_branch_ops(
         if name in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
             stack.append("counter" if arg == iter_var_slot else arg)
 
-        elif name == "LOAD_FAST_BORROW_LOAD_FAST_BORROW":
+        elif name in ("LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"):
             idx_a = (arg >> 4) & 0xF
             idx_b = arg & 0xF
             stack.append("counter" if idx_a == iter_var_slot else idx_a)

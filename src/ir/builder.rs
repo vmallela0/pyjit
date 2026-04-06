@@ -62,10 +62,12 @@ fn binary_result_type(op: &str, lhs: &IRType, rhs: &IRType) -> IRType {
     }
 }
 
-/// COMPARE_OP argument decoding. CPython 3.12+ encodes comparison + bool flag.
-fn compare_op_name(arg: i32) -> &'static str {
-    // The comparison is encoded in bits 4+, the lower bits are for bool conversion
-    match (arg >> 4) & 0xf {
+/// COMPARE_OP argument decoding.
+/// Python 3.12 encodes the comparison in bits 4+ (arg >> 4).
+/// Python 3.13+ encodes it in bits 5+ (arg >> 5) with bit 4 as a bool-conversion flag.
+fn compare_op_name(arg: i32, py_minor: u8) -> &'static str {
+    let idx = if py_minor >= 13 { (arg >> 5) & 0xf } else { (arg >> 4) & 0xf };
+    match idx {
         0 => "Lt",
         1 => "Le",
         2 => "Eq",
@@ -206,7 +208,7 @@ impl Builder {
 ///
 /// This is the main entry point called from Python via `build_ir(trace)`.
 #[pyfunction]
-pub fn build_ir(_py: Python<'_>, trace: &Bound<'_, Trace>) -> PyResult<IRProgram> {
+pub fn build_ir(py: Python<'_>, trace: &Bound<'_, Trace>) -> PyResult<IRProgram> {
     let trace = trace.borrow();
     let ops: Vec<TraceOp> = trace.ops.clone();
     let input_types: Vec<IRType> = trace
@@ -215,6 +217,7 @@ pub fn build_ir(_py: Python<'_>, trace: &Bound<'_, Trace>) -> PyResult<IRProgram
         .map(|t| IRType::from_type_name(t))
         .collect();
 
+    let py_minor = py.version_info().minor;
     let num_params = input_types.len() as u32;
     let mut builder = Builder::new(num_params, input_types.clone());
 
@@ -250,7 +253,8 @@ pub fn build_ir(_py: Python<'_>, trace: &Bound<'_, Trace>) -> PyResult<IRProgram
                 }
             }
 
-            "LOAD_FAST_BORROW_LOAD_FAST_BORROW" => {
+            "LOAD_FAST_LOAD_FAST" | "LOAD_FAST_BORROW_LOAD_FAST_BORROW" => {
+                // Python 3.13 uses LOAD_FAST_LOAD_FAST; Python 3.14 uses LOAD_FAST_BORROW_LOAD_FAST_BORROW
                 let idx_a = ((trace_op.arg >> 4) & 0xf) as usize;
                 let idx_b = (trace_op.arg & 0xf) as usize;
                 if let Some(v) = builder.load_local(idx_a) {
@@ -312,7 +316,7 @@ pub fn build_ir(_py: Python<'_>, trace: &Bound<'_, Trace>) -> PyResult<IRProgram
                 let rhs = builder.pop();
                 let lhs = builder.pop();
                 if let (Some(l), Some(r)) = (lhs, rhs) {
-                    let op_name = compare_op_name(trace_op.arg);
+                    let op_name = compare_op_name(trace_op.arg, py_minor);
                     let v = builder.emit(op_name, vec![l, r], IRType::Bool, op_name);
                     builder.push(v);
                 }

@@ -7,6 +7,7 @@ tracing JIT — the recorded trace becomes input to IR generation.
 
 from __future__ import annotations
 
+import dis
 import opcode
 import sys
 from typing import Any, Callable
@@ -65,6 +66,13 @@ def record_trace(
     target_code = func.__code__
     input_types = [_get_type_name(a) for a in args]
 
+    # Pre-build canonical offset → (name, arg) map from dis.get_instructions().
+    # This avoids reading adapted/specialized opcodes from co_code at runtime.
+    _canonical: dict[int, tuple[str, int]] = {
+        instr.offset: (instr.opname, instr.arg if instr.arg is not None else 0)
+        for instr in dis.get_instructions(target_code)
+    }
+
     # State for the tracer
     raw_ops: list[tuple[int, str, int]] = []  # (offset, opcode_name, arg)
     in_loop = False
@@ -86,13 +94,10 @@ def record_trace(
         if code is not target_code:
             return mon.DISABLE
 
-        raw = code.co_code
-        if offset >= len(raw):
+        entry = _canonical.get(offset)
+        if entry is None:
             return None
-
-        op = raw[offset]
-        arg = raw[offset + 1] if offset + 1 < len(raw) else 0
-        name = opcode.opname[op]
+        name, arg = entry
 
         # Track loop state
         if name in _LOOP_START_OPS:
@@ -170,9 +175,10 @@ def _build_trace_ops(
             type_stack.append(t)
             arg_types = [t]
 
-        elif name == "LOAD_FAST_BORROW_LOAD_FAST_BORROW":
+        elif name in ("LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"):
             # Fused opcode: loads two locals onto the stack.
             # Encoding: first pushed = arg >> 4, second pushed = arg & 0xf
+            # Python 3.13 uses LOAD_FAST_LOAD_FAST; Python 3.14 uses LOAD_FAST_BORROW_LOAD_FAST_BORROW
             idx_a = (arg >> 4) & 0xF
             idx_b = arg & 0xF
             t_a = local_types.get(idx_a, "object")
