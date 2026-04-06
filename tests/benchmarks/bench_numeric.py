@@ -5,9 +5,6 @@ Run with: pytest tests/benchmarks/bench_numeric.py --benchmark-only -v
 """
 from __future__ import annotations
 
-import math
-
-import pytest
 from pyjit import jit
 
 

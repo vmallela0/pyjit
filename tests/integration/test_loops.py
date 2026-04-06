@@ -1,7 +1,6 @@
 """Integration tests for loop compilation patterns."""
 from __future__ import annotations
 
-import pytest
 from pyjit import jit
 
 

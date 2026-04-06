@@ -73,7 +73,7 @@ class TestListWrite:
 
 
 try:
-    import numpy as np  # type: ignore[import-untyped]
+    import numpy as np  # type: ignore[import-untyped]  # noqa: F401
 
     HAS_NUMPY = True
 except ImportError:
