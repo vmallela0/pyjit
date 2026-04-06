@@ -3,6 +3,7 @@
 pyjit only compiles numeric (int/float) loops. Functions that work on strings,
 lists of strings, or other non-numeric types must fall back to CPython silently.
 """
+
 from __future__ import annotations
 
 from pyjit import jit

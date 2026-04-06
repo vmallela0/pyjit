@@ -1,4 +1,5 @@
 """Integration tests for arithmetic operations inside JIT-compiled loops."""
+
 from __future__ import annotations
 
 from pyjit import jit

@@ -3,6 +3,7 @@
 Measures JIT vs CPython speedup on typical numeric kernels.
 Run with: pytest tests/benchmarks/bench_numeric.py --benchmark-only -v
 """
+
 from __future__ import annotations
 
 from pyjit import jit

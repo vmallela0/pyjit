@@ -1,4 +1,5 @@
 """Integration tests for function inlining and call support."""
+
 from __future__ import annotations
 
 import math

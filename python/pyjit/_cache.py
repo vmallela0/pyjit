@@ -7,6 +7,7 @@ compilation step (~0.6 ms) still runs on every process start.
 Cache key: sha256(co_code + co_consts_repr + arg_types + version)
 Invalidation: automatic when bytecode, constants, or pyjit version changes.
 """
+
 from __future__ import annotations
 
 import hashlib

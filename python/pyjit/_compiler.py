@@ -819,7 +819,9 @@ def _extract_body_ops(
             true_instrs = [x for x in true_instrs if x.opname not in ("NOT_TAKEN", "NOP")]
 
             # Extract true branch body ops recursively
-            true_ops = _extract_body_ops(true_instrs, code, iter_var_slot, func_globals=func_globals)
+            true_ops = _extract_body_ops(
+                true_instrs, code, iter_var_slot, func_globals=func_globals
+            )
 
             # If POP_JUMP_IF_TRUE, the "true" branch is actually the skip (false path)
             # and the jump target is the real body. Swap them.
@@ -845,7 +847,9 @@ def _extract_body_ops(
                     if real_body_end is None:
                         real_body_end = len(instrs)
                     real_instrs = instrs[real_body_start:real_body_end]
-                    true_ops = _extract_body_ops(real_instrs, code, iter_var_slot, func_globals=func_globals)
+                    true_ops = _extract_body_ops(
+                        real_instrs, code, iter_var_slot, func_globals=func_globals
+                    )
                     i_skip = max(real_body_end, len(instrs))
                     false_start_idx = None  # no else for POP_JUMP_IF_TRUE
                 else:
@@ -870,7 +874,9 @@ def _extract_body_ops(
                 if false_end_idx is None:
                     false_end_idx = len(instrs)  # extends to end of body
                 false_instrs = instrs[false_start_idx:false_end_idx]
-                false_ops = _extract_body_ops(false_instrs, code, iter_var_slot, func_globals=func_globals)
+                false_ops = _extract_body_ops(
+                    false_instrs, code, iter_var_slot, func_globals=func_globals
+                )
                 i_skip = max(false_end_idx, len(instrs))
 
             # Emit: CondStart + true_ops + [CondElse + false_ops] + CondEnd
@@ -1211,7 +1217,9 @@ def _extract_body_ops(
 
             # Recursively extract inner body ops
             inner_body_instrs = instrs[inner_body_start:inner_body_end]
-            inner_ops = _extract_body_ops(inner_body_instrs, code, inner_iter_slot, func_globals=func_globals)
+            inner_ops = _extract_body_ops(
+                inner_body_instrs, code, inner_iter_slot, func_globals=func_globals
+            )
             if inner_ops is None:
                 return None
 

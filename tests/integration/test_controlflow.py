@@ -1,4 +1,5 @@
 """Integration tests for control flow: conditionals, break, and select ops."""
+
 from __future__ import annotations
 
 from pyjit import jit
@@ -66,9 +67,7 @@ class TestConditionals:
             return mx
 
         fn(0)
-        expected = max(
-            (i * 3 - i * i + 10 for i in range(20)), default=0
-        )
+        expected = max((i * 3 - i * i + 10 for i in range(20)), default=0)
         assert fn(20) == expected
 
 

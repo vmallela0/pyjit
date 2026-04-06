@@ -2,6 +2,7 @@
 
 Run with: pytest tests/benchmarks/ --benchmark-only -v
 """
+
 from __future__ import annotations
 
 import pytest

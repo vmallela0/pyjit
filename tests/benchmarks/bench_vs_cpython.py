@@ -6,6 +6,7 @@ the test fails — this prevents silent performance regressions.
 Run with: pytest tests/benchmarks/bench_vs_cpython.py -v
 (Does NOT require --benchmark-only; uses timeit directly so it works in CI.)
 """
+
 from __future__ import annotations
 
 import timeit
